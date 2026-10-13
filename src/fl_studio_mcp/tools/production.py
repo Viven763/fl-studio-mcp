@@ -8,43 +8,15 @@ playback position, loop mode and open windows.
 from __future__ import annotations
 
 import json
-import time
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from fastmcp import FastMCP
 
-# Runs inside FL: set a parameter so its display text reads `target` (numeric bisection).
-_BISECT = """
-import re
-def _num(s):
-    m = re.search(r"-?\\d+(?:[.,]\\d+)?", s or "")
-    if not m:
-        return None
-    v = float(m.group().replace(",", "."))
-    return v * 1000 if "kHz" in s else v
-def _set(i, s, p, v):
-    plugins.setParamValue(v, p, i, s, midi.PIM_None, True)
-    return _num(plugins.getParamValueString(p, i, s, True))
-def bisect(i, s, p, target):
-    lo, hi = 0.0, 1.0
-    rising = (_set(i, s, p, 1.0) or 0) > (_set(i, s, p, 0.0) or 0)
-    for _ in range(30):
-        mid = (lo + hi) / 2
-        x = _set(i, s, p, mid)
-        if x is None or (x < target) == rising:
-            lo = mid
-        else:
-            hi = mid
-    _set(i, s, p, (lo + hi) / 2)
-    return plugins.getParamValueString(p, i, s, True)
-"""
-
-
 def register_production_tools(mcp: FastMCP) -> None:
     from fl_studio_mcp.utils.connection import get_connection
     from fl_studio_mcp.utils.fl_exec import exec_in_fl
-    from fl_studio_mcp.utils.fl_files import reopen_and_wait, save_project_and_locate
+    from fl_studio_mcp.utils.fl_files import EDIT_LOCK, reopen_and_wait, save_project_and_locate
 
     def _exec(code: str, timeout: float = 10.0) -> Any:
         return exec_in_fl(code, timeout=timeout)
@@ -146,48 +118,90 @@ def register_production_tools(mcp: FastMCP) -> None:
         return {"added": res["added"], "backup": res["backup"]}
 
     @mcp.tool()
-    def fl_get_effect_params(insert: int, slot: int) -> dict:
-        """List an effect's parameters: index, name, normalized value and display text."""
-        try:
-            return _exec(f"""
-n = plugins.getParamCount({insert}, {slot}, True)
-result = {{"plugin": plugins.getPluginName({insert}, {slot}, False, True),
-          "params": [[i, plugins.getParamName(i, {insert}, {slot}, True),
-                      round(plugins.getParamValue(i, {insert}, {slot}, True), 4),
-                      plugins.getParamValueString(i, {insert}, {slot}, True)]
-                     for i in range(min(n, 64))
-                     if plugins.getParamName(i, {insert}, {slot}, True)]}}
-""")
-        except RuntimeError as e:
-            return {"error": str(e)}
+    def fl_get_effect_params(
+        insert: int, slot: int, start: int = 0, count: int = 64, options: bool = False
+    ) -> dict:
+        """List an effect's parameters: index, name, normalized value and display text.
+
+        Args:
+            insert: Mixer insert
+            slot: Effect slot (0-9)
+            start: First parameter index (page through big plugins)
+            count: How many parameters to list
+            options: Also list the choices of text-valued parameters (e.g. EQ band
+                     types), at most 16 per call
+        Returns {"plugin", "param_count", "params": [[index, name, value, text]],
+        "next": next start or None, "options": {"<index>": [labels]}?}.
+        """
+        from fl_studio_mcp.utils.fl_params import FL_PARAM_LIB, RISKY, is_textual, param_options
+
+        with EDIT_LOCK:
+            try:
+                res = _exec(FL_PARAM_LIB + """
+i, s = ARGS["i"], ARGS["s"]
+n = plugins.getParamCount(i, s, True)
+rows = []
+for p in range(ARGS["start"], min(n, ARGS["start"] + ARGS["count"])):
+    name = plugins.getParamName(p, i, s, True)
+    if name:
+        rows.append([p, name, round(_gv(p, i, s), 4), _pv(p, i, s)])
+nxt = ARGS["start"] + ARGS["count"]
+result = {"plugin": plugins.getPluginName(i, s, False, True), "param_count": n,
+          "params": rows, "next": nxt if nxt < n else None}
+""", args={"i": insert, "s": slot, "start": start, "count": count})
+                if options:
+                    opts = {}
+                    for p, name, _v, text in res["params"]:
+                        if len(opts) >= 16:
+                            break
+                        if is_textual(text) and not RISKY.search(name):
+                            opts[str(p)] = param_options(insert, slot, p)["options"]
+                    res["options"] = opts
+            except (RuntimeError, ValueError) as e:
+                return {"error": str(e)}
+        return res
 
     @mcp.tool()
     def fl_set_effect_params(insert: int, slot: int, params: list[dict]) -> dict:
         """Set effect parameters live (no reload).
 
-        Each item sets one parameter either by normalized value (0..1) or by the
-        number shown in FL's display (e.g. dB, Hz, ms), found by bisection:
-            {"param": 0, "value": 0.5}
-            {"param": 0, "target": -3.0}     # e.g. threshold -3 dB
-        Returns the resulting display text of every parameter set.
+        Each item names the parameter ("param": index or exact name) and gives
+        exactly one of:
+            {"param": 0, "value": 0.5}                  # normalized 0..1
+            {"param": 0, "target": -3.0}                # number shown by FL (dB, Hz, ms)
+            {"param": "Band 1 type", "text": "High pass"}   # label of a text-valued param
+        Returns {"params": {"<index>": display text}, "errors": [...]}.
         """
-        lines = [_BISECT, "out = {}"]
-        for p in params:
-            idx = int(p["param"])
-            if "target" in p:
-                lines.append(f"out[{idx}] = bisect({insert}, {slot}, {idx}, {float(p['target'])})")
-            else:
-                lines.append(
-                    f"plugins.setParamValue({float(p['value'])}, {idx}, {insert}, {slot}, "
-                    "midi.PIM_None, True)"
-                )
-                lines.append(
-                    f"out[{idx}] = plugins.getParamValueString({idx}, {insert}, {slot}, True)"
-                )
-        lines.append("result = out")
+        from fl_studio_mcp.utils.fl_params import set_params
+
+        with EDIT_LOCK:
+            try:
+                res = set_params(insert, slot, params)
+            except (RuntimeError, ValueError) as e:
+                return {"error": str(e)}
+        out = {"params": {k: v["text"] for k, v in res["params"].items()}}
+        if res["errors"]:
+            out["errors"] = res["errors"]
+        return out
+
+    @mcp.tool()
+    def fl_get_mixer_routing(track: int | None = None) -> dict:
+        """Read mixer routing: which insert each channel feeds, and every send.
+
+        Without `track`: channels with their inserts, plus the master and every
+        insert that is named, fed by a channel, or routed anywhere other than
+        straight to the master at unity (with the buses it feeds).
+
+        Args:
+            track: Only this insert (its routes and inputs)
+        Returns {"inserts": [{"track", "name", "channels", "routes": [{"to", "to_name",
+        "level"}], "inputs": [...]}], "channels": [...], "note"}. Level 0.8 = 0 dB.
+        """
+        from fl_studio_mcp.utils.fl_mixer import build_routing_view, read_routing
+
         try:
-            return {"params": _exec("\n".join(lines), timeout=30)}
-        except RuntimeError as e:
+            return build_routing_view(read_routing(), track)
+        except (RuntimeError, ValueError, KeyError) as e:
             return {"error": str(e)}
 
     @mcp.tool()
@@ -197,48 +211,26 @@ result = {{"plugin": plugins.getPluginName({insert}, {slot}, False, True),
         sends: list[dict] | None = None,
         volumes_db: dict[str, float] | None = None,
     ) -> dict:
-        """Route channels, name inserts, add sends and set insert volumes in dB (live, no reload).
+        """Route channels, name inserts, add/remove sends and set insert faders in dB (live).
+
+        Everything is applied in one call; the result reads back what FL now has.
 
         Args:
-            routes: [{"channel": "808", "insert": 4}] - channel by exact name or index
+            routes: [{"channel": "808", "insert": 4}] - channel by exact (unique) name or
+                    global index
             names: {"4": "808"} insert names
-            sends: [{"from": 6, "to": 10, "level": 0.35}] e.g. to a reverb bus
-            volumes_db: {"4": -2.0} insert fader in dB (0.8 = 0 dB in FL's scale)
+            sends: [{"from": 6, "to": 10, "level": 0.35}] e.g. to a reverb bus.
+                   level = send knob 0..1 (0.8 = 0 dB). {"from": 6, "to": 10, "remove": true}
+                   removes a send; "exclusive": true first removes every other route of
+                   `from` (including the master), e.g. to feed a bus only.
+            volumes_db: {"4": -2.0} insert fader in dB (max about +5.6 dB)
+        Returns {"routing", "volumes_db", "sends": [{"from", "to", "active", "level"}],
+        "outputs", "warnings"?}.
         """
-        try:
-            chan = _channel_names()
-            lines = []
-            for r in routes or []:
-                c = r["channel"]
-                idx = chan.index(c) if isinstance(c, str) else int(c)
-                lines.append(f"channels.setTargetFxTrack({idx}, {int(r['insert'])})")
-            for i, n in (names or {}).items():
-                lines.append(f"mixer.setTrackName({int(i)}, {json.dumps(n)})")
-            for s in sends or []:
-                lines.append(f"mixer.setRouteTo({int(s['from'])}, {int(s['to'])}, True)")
-                lines.append(
-                    f"mixer.setRouteToLevel({int(s['from'])}, {int(s['to'])}, {float(s['level'])})"
-                )
-            _exec("\n".join(lines) + "\nresult = 1")
-            vols = {}
-            for i, db in (volumes_db or {}).items():  # fader curve: bisection on the dB readout
-                t = int(i)
-                lo, hi = 0.0, 1.0
-                for _ in range(20):
-                    mid = (lo + hi) / 2
-                    _exec(f"mixer.setTrackVolume({t}, {mid}, midi.PIM_None)\nresult = 1")
-                    time.sleep(0.02)
-                    cur = _exec(f"result = mixer.getTrackVolume({t}, 1)")
-                    if cur is None or cur < db:
-                        lo = mid
-                    else:
-                        hi = mid
-                _exec(f"mixer.setTrackVolume({t}, {(lo + hi) / 2}, midi.PIM_None)\nresult = 1")
-                vols[t] = round(_exec(f"result = mixer.getTrackVolume({t}, 1)"), 1)
-            routed = _exec(
-                "result = [[channels.getChannelName(i), channels.getTargetFxTrack(i)] "
-                "for i in range(channels.channelCount())]"
-            )
-        except (RuntimeError, ValueError) as e:
-            return {"error": str(e)}
-        return {"routing": routed, "volumes_db": vols}
+        from fl_studio_mcp.utils.fl_mixer import mixer_setup
+
+        with EDIT_LOCK:
+            try:
+                return mixer_setup(routes, names, sends, volumes_db)
+            except (RuntimeError, ValueError, KeyError) as e:
+                return {"error": str(e)}

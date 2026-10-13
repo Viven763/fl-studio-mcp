@@ -25,6 +25,7 @@ from fl_studio_mcp.tools import (
     register_channel_tools,
     register_extended_tools,
     register_mixer_tools,
+    register_params_tools,
     register_piano_roll_tools,
     register_plugin_tools,
     register_production_tools,
@@ -146,6 +147,7 @@ register_piano_roll_tools(mcp)
 register_extended_tools(mcp)
 register_audio_tools(mcp)
 register_production_tools(mcp)
+register_params_tools(mcp)
 
 
 def main():
