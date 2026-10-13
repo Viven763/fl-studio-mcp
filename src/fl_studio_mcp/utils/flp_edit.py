@@ -147,20 +147,45 @@ def _playlist_item_size(data: bytes) -> int:
     raise ValueError("unrecognized playlist item layout")
 
 
-def delete_channels(project: Path, names: list[str]) -> dict:
-    """Remove channels (by exact name) from a saved .flp in place, keeping a backup."""
+def delete_channels(
+    project: Path,
+    names: list[str] | None = None,
+    indices: list[int] | None = None,
+    live_names: list[str] | None = None,
+) -> dict:
+    """Remove channels (by exact name or global index) from a saved .flp, keeping a backup.
+
+    `live_names` (the channel names FL shows) makes names match what the user
+    sees and guards against the file and FL disagreeing about channel order.
+    A name shared by several channels is refused with their indices.
+    """
     header, events = read_events(project.read_bytes())
     present = {UNSUPPORTED[e] for e, _ in events if e in UNSUPPORTED}
     if present:
         raise ValueError(f"project uses {', '.join(sorted(present))}; refusing to edit it")
 
     current = channel_names(events)
-    targets = set()
-    for name in names:
-        hits = [i for i, n in enumerate(current) if n == name]
-        if len(hits) != 1:
-            raise ValueError(f"channel '{name}' matches {len(hits)} channels; names must be unique")
-        targets.add(hits[0])
+    if live_names is not None and len(live_names) != len(current):
+        raise ValueError("FL and the saved file list different channels; save and retry")
+    labels = live_names or current
+    targets: set[int] = set()
+    for i in indices or []:
+        if not 0 <= int(i) < len(current):
+            raise ValueError(f"channel {i} does not exist (0-{len(current) - 1})")
+        targets.add(int(i))
+    ambiguous: dict[str, list[int]] = {}
+    for name in names or []:
+        hits = [i for i, n in enumerate(labels) if n == name]
+        if not hits:
+            raise ValueError(f"no channel named {name!r}")
+        if len(hits) > 1:
+            ambiguous[name] = hits
+        else:
+            targets.add(hits[0])
+    if ambiguous:
+        raise ValueError(f"ambiguous channel names {ambiguous}; pass indices instead")
+    if not targets:
+        raise ValueError("no channels given")
 
     mapping: dict[int, int | None] = {}
     new_index = 0
@@ -201,7 +226,11 @@ def delete_channels(project: Path, names: list[str]) -> dict:
 
     backup = make_backup(project, "delete")
     atomic_write(project, data)
-    return {"deleted": sorted(names), "channels": remaining, "backup": str(backup)}
+    return {
+        "deleted": [{"index": i, "name": labels[i]} for i in sorted(targets)],
+        "channels": [n for i, n in enumerate(labels) if i not in targets],
+        "backup": str(backup),
+    }
 
 
 EV_SAMPLE_PATH = 196

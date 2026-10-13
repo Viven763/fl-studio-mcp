@@ -223,19 +223,59 @@ def register_extended_tools(mcp: FastMCP) -> None:
 
         return {"tones": find_tones(query, limit)}
 
+    def _zen_state_reader():
+        from fl_studio_mcp.utils.zenology import channel_tone
+
+        send = get_connection().send_command
+        return lambda ch: channel_tone(save_project_and_locate(send), ch)
+
+    @mcp.tool()
+    def fl_zenology_current_tone(channel: int) -> dict:
+        """Which ZENOLOGY tone a channel really holds (read from the saved project).
+
+        Channel names can lie (a tone loaded by mistake keeps the requested
+        name); this reads the plugin state FL saves. Saves the project first.
+
+        Args:
+            channel: Channel index (global)
+        Returns {"channel", "channel_name", "pack", "pack_id", "number", "name",
+        "listed_name", "category", "matches_channel_name"}.
+        """
+        from fl_studio_mcp.utils.fl_exec import exec_in_fl
+        from fl_studio_mcp.utils.zenology import ZenologyError, channel_tone
+
+        with EDIT_LOCK:
+            try:
+                project = save_project_and_locate(get_connection().send_command)
+                info = channel_tone(project, channel)
+                ch_name = exec_in_fl("result = channels.getChannelName(ARGS['c'], True)",
+                                     args={"c": channel})
+            except (RuntimeError, ValueError, ZenologyError) as e:
+                return {"error": str(e)}
+        names = {re.sub(r"\W", "", str(info.get(k, ""))).lower() for k in ("name", "listed_name")}
+        return {"channel": channel, "channel_name": ch_name, **info,
+                "matches_channel_name": re.sub(r"\W", "", ch_name).lower() in names}
+
     @mcp.tool()
     def fl_zenology_load(name: str, pack: str | None = None) -> dict:
-        """Load a ZENOLOGY library tone by name as a NEW channel (macOS accelerator).
+        """Load a ZENOLOGY library tone by name as a NEW channel (macOS).
 
         ZENOLOGY can't switch tones via host presets or MIDI, so this presses
-        its tone arrow once and verifies the name on screen - macOS only. FL
-        must be visible; don't touch the mouse (~6 s). For a portable result,
-        follow up with fl_save_channel_preset and recall it via fl_load_preset.
+        its tone arrow and corrects until the right number shows (up to 5
+        clicks), then checks the tone FL saved for the new channel
+        (verified_by "state"; the project is saved for that). FL must be
+        visible; don't touch the mouse (~6-10 s). Needs Screen Recording and
+        Accessibility permissions for the app running this server.
 
         Args:
             name: Tone name from fl_zenology_find (exact match preferred)
             pack: Optional pack folder to disambiguate, e.g. "EXZ008_VintKeys"
+        Returns {"channel", "channel_name", "verified", "verified_by", "clicks",
+        "loaded": {"pack_id", "number", "name"}}; if not verified, the new channel
+        holds a different tone - delete it with fl_delete_channels(indices=[channel]).
         """
+        import subprocess
+
         from fl_studio_mcp.utils.zenology import ZenologyError, find_tones, load_tone
 
         matches = [t for t in find_tones(name, 50) if pack is None or t["pack"] == pack]
@@ -251,10 +291,11 @@ def register_extended_tools(mcp: FastMCP) -> None:
                 "error": "fl_zenology_load is macOS-only. Pick the tone in ZENOLOGY once, "
                 "then use fl_save_channel_preset / fl_load_preset."
             }
-        try:
-            return load_tone(matches[0], get_connection().send_command)
-        except ZenologyError as e:
-            return {"error": str(e)}
+        with EDIT_LOCK:
+            try:
+                return load_tone(matches[0], get_connection().send_command, _zen_state_reader())
+            except (ZenologyError, subprocess.SubprocessError, OSError) as e:
+                return {"error": str(e)}
 
     @mcp.tool()
     def fl_zenology_load_factory(bank: str, number: int, name: str | None = None) -> dict:
@@ -262,58 +303,59 @@ def register_extended_tools(mcp: FastMCP) -> None:
 
         Factory banks (PRST_A Factory Presets ... PRST_L Essential 2) have no name
         list on disk, so the tone is addressed by the number ZENOLOGY shows
-        (e.g. bank "PRST_F", number 605) and only the number is verified.
+        (e.g. bank "PRST_F", number 605); pack and number are verified.
 
         Args:
             bank: "PRST_F" or just "F"
             number: Tone number as displayed in ZENOLOGY's browser
             name: Optional channel name, e.g. "Polysynth 1"
         """
+        import subprocess
+
         from fl_studio_mcp.utils.zenology import ZenologyError, load_factory_tone
 
         if platform.system() != "Darwin":
             return {"error": "fl_zenology_load_factory is macOS-only"}
-        try:
-            return load_factory_tone(bank, number, get_connection().send_command, name)
-        except ZenologyError as e:
-            return {"error": str(e)}
+        with EDIT_LOCK:
+            try:
+                return load_factory_tone(bank, number, get_connection().send_command, name,
+                                         _zen_state_reader())
+            except (ZenologyError, subprocess.SubprocessError, OSError) as e:
+                return {"error": str(e)}
 
     @mcp.tool()
-    def fl_delete_channels(names: list[str]) -> dict:
-        """Delete channels by exact name (any OS).
+    def fl_delete_channels(
+        names: list[str] | None = None, indices: list[int] | None = None
+    ) -> dict:
+        """Delete channels by exact name or by global index (any OS).
 
         FL's scripting API can't delete channels, so this saves the project,
         cuts the channels out of the .flp (remapping pattern notes and playlist
-        clips to the new channel numbers), keeps a timestamped backup next to
-        the project and reopens it in FL. The project must already be saved to
-        a file once.
+        clips to the new channel numbers), keeps a backup in the project's
+        Backup folder and reloads it in FL (position, pattern, windows kept).
+        A name shared by several channels is refused with their indices.
 
         Args:
             names: Exact channel names, e.g. ["test_234", "Deep Sea"]
+            indices: Global channel indices, e.g. [10] (safe with duplicate names)
         """
+        from fl_studio_mcp.utils.fl_exec import exec_in_fl
         from fl_studio_mcp.utils.flp_edit import delete_channels
 
-        try:
-            project = save_project_and_locate(get_connection().send_command)
-            result = delete_channels(project, names)
-            open_in_fl(project)
-        except (RuntimeError, ValueError, OSError) as e:
-            return {"error": str(e)}
-        expected = result["channels"]
-        actual: list[str] = []
-        for _ in range(30):  # wait for FL to reload the project
-            time.sleep(0.5)
-            listing = get_connection().send_command("channels.getAll")
-            actual = [c["name"] for c in listing.get("channels", [])]
-            if actual == expected:
-                return {**result, "reloaded": True}
-        return {
-            **result,
-            "reloaded": False,
-            "fl_channels": actual,
-            "hint": "FL hasn't reloaded the edited project; open it via File > Open "
-            "(answer 'No' if FL asks to save the old version).",
-        }
+        send = get_connection().send_command
+        with EDIT_LOCK:
+            try:
+                project = save_project_and_locate(send)
+                live = exec_in_fl("result = [channels.getChannelName(c, True) "
+                                  "for c in range(channels.channelCount(1))]")
+                result = delete_channels(project, names, indices, live_names=live)
+            except (RuntimeError, ValueError, OSError) as e:
+                return {"error": str(e)}
+            result["reloaded"] = reopen_and_wait(send, project, expected=result["channels"])
+        if not result["reloaded"]:
+            result["hint"] = ("FL hasn't reloaded the edited project; open it with "
+                              "fl_open_project (answer 'No' if FL asks to save the old version).")
+        return result
 
     @mcp.tool()
     def fl_read_notes(pattern: int, channel: int | None = None, raw: bool = False) -> dict:

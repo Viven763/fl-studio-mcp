@@ -22,6 +22,7 @@ import struct
 import subprocess
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from fl_studio_mcp.utils.fl_files import open_in_fl, user_data_dir
@@ -108,13 +109,24 @@ def build_fst(pack_id: int, tone_index: int, channel_name: str, out_path: Path) 
     return out_path
 
 
+def _run(cmd: list[str], timeout: float = 20.0) -> subprocess.CompletedProcess:
+    """Run a helper command; failures become ZenologyError (with stderr) instead of crashing."""
+    try:
+        return subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=timeout)
+    except subprocess.CalledProcessError as e:
+        detail = (e.stderr or e.stdout or "").strip()
+        hint = " (grant Screen Recording to the app running the MCP server)" if (
+            cmd and cmd[0] == "screencapture") else ""
+        raise ZenologyError(f"{cmd[0]} failed{hint}: {detail or e}") from e
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        raise ZenologyError(f"{cmd[0]} failed: {e}") from e
+
+
 def _helper() -> Path:
     exe = CACHE / "flhelper"
     if not exe.exists() or exe.stat().st_mtime < HELPER_SRC.stat().st_mtime:
         CACHE.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            ["swiftc", "-O", str(HELPER_SRC), "-o", str(exe)], check=True, capture_output=True
-        )
+        _run(["swiftc", "-O", str(HELPER_SRC), "-o", str(exe)], timeout=180)
     return exe
 
 
@@ -130,7 +142,12 @@ def _front_is_fl() -> bool:
     return _osa(events + "get name of first process whose frontmost is true") == "OsxFL"
 
 
-def _window_rect(title_prefix: str) -> tuple[int, int, int, int] | None:
+def title_matches(window_title: str, channel_name: str) -> bool:
+    """A plugin window is titled "<channel name> (...)"; match that name exactly."""
+    return window_title == channel_name or window_title.startswith(channel_name + " (")
+
+
+def _window_rect(channel_name: str) -> tuple[int, int, int, int] | None:
     out = _osa(
         'tell application "System Events" to tell process "OsxFL"\n'
         "set r to {}\n"
@@ -145,7 +162,7 @@ def _window_rect(title_prefix: str) -> tuple[int, int, int, int] | None:
     )
     for line in out.splitlines():
         name, _, rect = line.partition("|")
-        if name.startswith(title_prefix) and rect:
+        if title_matches(name, channel_name) and rect:
             x, y, w, h = (int(float(v)) for v in rect.split(","))
             return x, y, w, h
     return None
@@ -155,23 +172,136 @@ def read_tone_label(rect: tuple[int, int, int, int]) -> str:
     x, y, w, h = rect
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
         shot = tmp.name
-    subprocess.run(["screencapture", "-x", "-R", f"{x},{y},{w},{h}", shot], check=True)
-    text = subprocess.run([str(_helper()), "ocr", shot], capture_output=True, text=True).stdout
-    Path(shot).unlink(missing_ok=True)
-    return text
+    try:
+        _run(["screencapture", "-x", "-R", f"{x},{y},{w},{h}", shot])
+        return _run([str(_helper()), "ocr", shot]).stdout
+    finally:
+        Path(shot).unlink(missing_ok=True)
 
 
-def load_tone(tone: dict, send_command) -> dict:
-    """Load `tone` (an entry from find_tones) as a new FL channel and verify it."""
+def unique_channel_name(base: str, existing: list[str]) -> str:
+    """`base`, or "base 2", "base 3"... so the new plugin window's title is unique."""
+    name, n = base, 2
+    while name in existing:
+        name = f"{base} {n}"
+        n += 1
+    return name
+
+
+def plan_clicks(current: int, target: int) -> tuple[str, int]:
+    """Which tone arrow to press and how often to get from `current` to `target`."""
+    return ("next", target - current) if target >= current else ("prev", current - target)
+
+
+# ---------------------------------------------------------------- reading a channel's tone
+
+ZEN_KEY = "jp.co.roland.ZENOLOGY.data"
+ADDR_NAME, NAME_CHARS, NAME_STRIDE = 0x1130, 16, 4
+
+
+def state_plist(payload: bytes) -> dict | None:
+    """The plist inside a plugin state event (213), or None when there is none."""
+    off = payload.find(b"bplist00")
+    if off < 0:
+        return None
+    size = struct.unpack_from("<q", payload, off - 8)[0] if off >= 8 else 0
+    end = off + size if 0 < size <= len(payload) - off else len(payload)
+    try:
+        return plistlib.loads(payload[off:end])
+    except Exception:  # noqa: BLE001 - not a plist we understand
+        return None
+
+
+def read_tone_from_state(payload: bytes) -> dict:
+    """{"pack_id", "index", "number", "name"} of the tone a ZENOLOGY state holds."""
+    plist = state_plist(payload)
+    blob = plist.get(ZEN_KEY) if plist else None
+    if not blob:
+        raise ZenologyError("not a ZENOLOGY plugin state")
+    pairs = {
+        struct.unpack(">I", blob[i:i + 4])[0]: struct.unpack(">I", blob[i + 4:i + 8])[0]
+        for i in range(0, len(blob) - 7, 8)
+    }
+    chars = [pairs.get(ADDR_NAME + NAME_STRIDE * k, 32) for k in range(NAME_CHARS)]
+    name = "".join(chr(c) if 32 <= c < 127 else " " for c in chars).strip()
+    index = pairs.get(ADDR_TONE)
+    return {
+        "pack_id": pairs.get(ADDR_PACK),
+        "index": index,
+        "number": index + 1 if index is not None else None,
+        "name": name,
+    }
+
+
+def describe_tone(info: dict) -> dict:
+    """Add the pack folder, listed name and category from the tone index."""
+    tones = json.loads(TONES_FILE.read_text())
+    hit = next(
+        (t for t in tones if t["pack_id"] == info["pack_id"] and t["no"] == info["number"]), None
+    )
+    out = dict(info)
+    if hit:
+        out.update(pack=hit["pack"], listed_name=hit["name"], category=hit["category"],
+                   consistent=_norm(hit["name"]) == _norm(info["name"]))
+    return out
+
+
+def channel_tone(project: Path, channel: int) -> dict:
+    """The ZENOLOGY tone of channel `channel` in a saved project."""
+    from fl_studio_mcp.utils.fl_files import _channel_blocks
+
+    _, events = read_events(project.read_bytes())
+    block = _channel_blocks(events).get(channel)
+    if block is None:
+        raise ZenologyError(f"channel {channel} not found in {project.name}")
+    state = next((v for e, v in block if e == 213), None)
+    if state is None:
+        raise ZenologyError(f"channel {channel} has no plugin state")
+    return describe_tone(read_tone_from_state(state))
+
+
+# ---------------------------------------------------------------- loading tones on screen
+
+
+def _numbers(text: str) -> list[int]:
+    # OCR may read the arrow before the number as a letter ("v 07:")
+    return [int(m) for m in re.findall(r"(?m)^[^\d\n]{0,4}(\d+)\s*:", text)]
+
+
+def _click_arrow(rect: tuple[int, int, int, int], direction: str) -> None:
+    dx, dy = ARROW_PREV if direction == "prev" else ARROW_NEXT
+    _run([str(_helper()), "click", str(rect[0] + dx), str(rect[1] + dy)])
+
+
+def _observe_screen(rect: tuple[int, int, int, int], title: str) -> tuple[int | None, str]:
+    lines = [ln for ln in read_tone_label(rect).splitlines() if not ln.startswith(title)]
+    text = "\n".join(lines)
+    numbers = _numbers(text)
+    return (numbers[0] if numbers else None), text
+
+
+def load_tone(tone: dict, send_command, read_state: Callable | None = None) -> dict:
+    """Load `tone` (an entry from find_tones) as a new FL channel and verify it.
+
+    `read_state(channel)` (optional) returns the tone FL saved for the channel
+    (see channel_tone); it is the most reliable check.
+    """
     use_prev = tone["no"] < _pack_size(tone["pack"])
     # Stored index i is displayed as number i+1, so ▲ from i loads tone i, ▼ from i-2 loads tone i.
     index = tone["no"] if use_prev else tone["no"] - 2
+    existing = [c["name"] for c in send_command("channels.getAll").get("channels", [])]
+    base = re.sub(r"[^A-Za-z0-9 ._'-]", "_", tone["name"]).strip()[:24] or "ZENOLOGY"
     # FL names the new channel (and its plugin window) after the file name.
-    name = re.sub(r"[^A-Za-z0-9 ._'-]", "_", tone["name"]).strip()[:24] or "ZENOLOGY"
+    name = unique_channel_name(base, existing)
     folder = CACHE / f"zen_{tone['pack_id']}_{tone['no']}"
     folder.mkdir(parents=True, exist_ok=True)
     fst = build_fst(tone["pack_id"], index, name, folder / f"{name}.fst")
+    channel = _open_fst(fst, send_command)
+    return _select_on_screen(tone, channel, name, use_prev, send_command, read_state)
 
+
+def _open_fst(fst: Path, send_command) -> int:
+    """Open a channel preset in FL and return the index of the channel it added."""
     def count() -> int | None:  # FL can be busy for seconds while a plugin instance loads
         return send_command("channels.getCount", timeout=5.0).get("count")
 
@@ -192,49 +322,95 @@ def load_tone(tone: dict, send_command) -> dict:
             break
     if after != before + 1:
         raise ZenologyError(f"FL did not add a channel (count {before} -> {after})")
-    channel = after - 1
-
-    return _select_on_screen(tone, channel, name, use_prev, send_command)
+    return after - 1
 
 
-def _select_on_screen(tone: dict, channel: int, name: str, use_prev: bool, send_command) -> dict:
-    if not _front_is_fl():
-        raise ZenologyError("FL Studio is not the frontmost app; refusing to click")
-    rect = None
+def _find_window(name: str, channel: int, send_command) -> tuple[int, int, int, int] | None:
     for attempt in range(24):  # macOS only lists windows of the visible Space; give FL a moment
         rect = _window_rect(name)
         if rect:
-            break
+            return rect
         if attempt in (8, 16):  # FL sometimes loads the plugin without showing its window
-            send_command("debug.exec", {"code": f"channels.showEditor({channel}, 0)\nresult = 1"})
-            time.sleep(0.5)
-            send_command("debug.exec", {"code": f"channels.showEditor({channel}, 1)\nresult = 1"})
+            for show in (0, 1):
+                code = f"channels.showEditor({channel}, {show}, True)\nresult = 1"
+                send_command("debug.exec", {"code": code})
+                time.sleep(0.5)
         time.sleep(0.5)
-    if rect is None:
-        raise ZenologyError(f"ZENOLOGY window for channel {channel} did not open")
-    dx, dy = ARROW_PREV if use_prev else ARROW_NEXT
-    subprocess.run([str(_helper()), "click", str(rect[0] + dx), str(rect[1] + dy)], check=True)
-    time.sleep(1.5)
+    return None
 
-    # Drop the window title: it repeats the channel/file name, not the loaded tone.
-    title = f"{name} ("
-    lines = [line for line in read_tone_label(rect).splitlines() if not line.startswith(title)]
-    text = "\n".join(lines)
-    send_command("channels.closeEditor", {"index": channel})
-    # OCR may read the ▼ arrow before the number as a letter ("v 07:")
-    numbers = [int(m) for m in re.findall(r"(?m)^[^\d\n]{0,4}(\d+)\s*:", text)]
-    ok = tone["no"] in numbers and _norm(tone["name"]) in _norm(text)
-    label = " / ".join(
-        line for line in lines
-        if re.match(r"^\s*\d+\s*:", line) or _norm(tone["name"]) in _norm(line)
-    )
-    return {
+
+def _select_on_screen(
+    tone: dict,
+    channel: int,
+    name: str,
+    use_prev: bool,
+    send_command,
+    read_state: Callable | None = None,
+    click: Callable | None = None,
+    observe: Callable | None = None,
+    find_window: Callable | None = None,
+    max_clicks: int = 5,
+    settle: float = 1.2,
+) -> dict:
+    """Press the tone arrow, then correct until the shown number is the target.
+
+    The window is always closed again. With `read_state`, the result is checked
+    against the tone FL actually saved for the channel (verified_by "state");
+    otherwise against what is on screen (verified_by "ocr").
+    """
+    click = click or _click_arrow
+    observe = observe or _observe_screen
+    find_window = find_window or (lambda: _find_window(name, channel, send_command))
+    if click is _click_arrow and not _front_is_fl():
+        raise ZenologyError("FL Studio is not the frontmost app; refusing to click")
+    target = int(tone["no"])
+    clicks, shown, label = 0, None, ""
+    try:
+        rect = find_window()
+        if rect is None:
+            raise ZenologyError(f"ZENOLOGY window for channel {channel} did not open")
+        click(rect, "prev" if use_prev else "next")
+        clicks = 1
+        while True:
+            time.sleep(settle)
+            try:
+                shown, label = observe(rect, f"{name} (")
+            except ZenologyError:
+                shown = None  # can't read the screen: rely on the saved state below
+            if shown is None or shown == target or clicks >= max_clicks:
+                break
+            direction, _n = plan_clicks(shown, target)
+            click(rect, direction)  # one step at a time, then look again
+            clicks += 1
+    finally:
+        send_command("channels.closeEditor", {"index": channel})
+
+    loaded, verified_by, ok = None, None, False
+    if read_state is not None:
+        try:
+            loaded = read_state(channel)
+        except Exception:  # noqa: BLE001 - fall back to the screen
+            loaded = None
+    if loaded is not None:
+        verified_by = "state"
+        ok = loaded.get("number") == target and loaded.get("pack_id") == tone["pack_id"]
+    elif shown is not None:
+        verified_by = "ocr"
+        wanted = _norm(tone["name"])
+        ok = shown == target and (not wanted or wanted in _norm(label))
+    result = {
         "channel": channel,
+        "channel_name": name,
         "tone": tone["name"],
         "pack": tone["pack"],
-        "screen_label": label,
         "verified": ok,
+        "verified_by": verified_by,
+        "clicks": clicks,
+        "screen_label": " / ".join(ln for ln in label.splitlines() if ln.strip()),
     }
+    if loaded is not None:
+        result["loaded"] = {k: loaded.get(k) for k in ("pack_id", "number", "name")}
+    return result
 
 
 # Factory banks (PRST_A ... PRST_L) are built into the plugin and have no tone
@@ -250,30 +426,21 @@ def factory_pack_id(bank: str) -> int:
     return FACTORY_BASE + ord(letter) - ord("A") + 1
 
 
-def load_factory_tone(bank: str, number: int, send_command, name: str | None = None) -> dict:
+def load_factory_tone(bank: str, number: int, send_command, name: str | None = None,
+                      read_state: Callable | None = None) -> dict:
     """Load factory tone `number` (as shown in ZENOLOGY) from bank PRST_<letter>.
 
-    There is no name list for factory banks, so only the number is verified.
+    There is no name list for factory banks, so only the number (and pack) is verified.
     """
     tone = {"pack": f"PRST_{bank.strip().upper().removeprefix('PRST_')[:1]}",
-            "pack_id": factory_pack_id(bank), "no": int(number),
-            "name": name or f"Factory {int(number)}"}
-    label = re.sub(r"[^A-Za-z0-9 ._'-]", "_", tone["name"]).strip()[:24] or "ZENOLOGY"
+            "pack_id": factory_pack_id(bank), "no": int(number), "name": ""}
+    existing = [c["name"] for c in send_command("channels.getAll").get("channels", [])]
+    base = re.sub(r"[^A-Za-z0-9 ._'-]", "_", name or f"Factory {int(number)}").strip()[:24]
+    label = unique_channel_name(base or "ZENOLOGY", existing)
     folder = CACHE / f"zen_{tone['pack_id']}_{tone['no']}"
     folder.mkdir(parents=True, exist_ok=True)
     fst = build_fst(tone["pack_id"], tone["no"], label, folder / f"{label}.fst")
-    before = send_command("channels.getCount", timeout=5.0).get("count")
-    open_in_fl(fst)
-    after = before
-    deadline = time.time() + 30
-    while time.time() < deadline:
-        time.sleep(1.0)
-        after = send_command("channels.getCount", timeout=5.0).get("count")
-        if isinstance(after, int) and isinstance(before, int) and after > before:
-            break
-    if not (isinstance(before, int) and after == before + 1):
-        raise ZenologyError(f"FL did not add a channel (count {before} -> {after})")
-    result = _select_on_screen({**tone, "name": "\x00"}, after - 1, label, True, send_command)
-    shown = [int(m) for m in re.findall(r"(\d+)\s*:", result["screen_label"])]
-    result["tone"], result["verified"] = tone["name"], tone["no"] in shown
+    channel = _open_fst(fst, send_command)
+    result = _select_on_screen(tone, channel, label, True, send_command, read_state)
+    result["tone"] = name or f"Factory {int(number)}"
     return result

@@ -271,19 +271,25 @@ def reopen_and_wait(
     expected: list[str] | None = None,
     restore: bool = True,
     grace: float = 8.0,
+    check_names: bool = True,
+    expected_count: int | None = None,
 ) -> bool:
-    """Reopen `project` in FL, wait until it has really reloaded, then restore state.
+    """Open `project` in FL (usually the one already open), wait until it has really
+    loaded, then restore what the user had going.
 
     Playback, song position (in ticks), loop mode, current pattern and which
-    main windows were open are captured before the reload and put back
-    afterwards, so a file edit feels like an in-place update. The reload is
-    detected by the parked song position changing (plus the channel list being
-    `expected`, default: unchanged); if the position never moves, the names
-    alone are trusted after `grace` seconds.
+    main windows were open are captured before and put back afterwards (unless
+    `restore` is False, e.g. when switching to another project), so a file edit
+    feels like an in-place update. Loading is detected by the parked song
+    position changing, plus the channel list being `expected` (default:
+    unchanged) or `expected_count` long; if the position never moves, the
+    channel check alone is trusted after `grace` seconds.
     """
-    if expected is None:
+    if check_names and expected is None:
         probe = _exec_quiet(send_command, _PROBE)
         expected = probe[1] if probe else None
+    if not check_names:
+        expected = None
     state = _exec_quiet(send_command, _CAPTURE, timeout=5.0)
     open_in_fl(project)
     started = time.time()
@@ -294,6 +300,8 @@ def reopen_and_wait(
             continue
         pos, names = probe
         if expected is not None and names != expected:
+            continue
+        if expected_count is not None and len(names) != expected_count:
             continue
         if pos != SENTINEL_TICKS or time.time() - started >= grace:
             time.sleep(1.0)  # let FL finish restoring plugin states

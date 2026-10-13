@@ -29,6 +29,7 @@ from fl_studio_mcp.tools import (
     register_piano_roll_tools,
     register_plugin_tools,
     register_production_tools,
+    register_project_tools,
     register_transport_tools,
 )
 from fl_studio_mcp.utils.connection import get_connection, reset_connection
@@ -148,6 +149,7 @@ register_extended_tools(mcp)
 register_audio_tools(mcp)
 register_production_tools(mcp)
 register_params_tools(mcp)
+register_project_tools(mcp)
 
 
 def main():
