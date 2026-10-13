@@ -11,11 +11,10 @@ channel references aren't understood here are refused rather than risked.
 
 from __future__ import annotations
 
-import shutil
 import struct
-import time
 from pathlib import Path
 
+from fl_studio_mcp.utils.backups import atomic_write, make_backup
 from fl_studio_mcp.utils.flp_events import read_events, write_events
 
 EV_CH_NEW, EV_CH_TYPE, EV_CH_END = 64, 21, 51
@@ -143,10 +142,8 @@ def delete_channels(project: Path, names: list[str]) -> dict:
     if remaining != expected:
         raise ValueError("edit verification failed; project left untouched")
 
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    backup = project.with_name(f"{project.stem}.before-delete-{stamp}.flp")
-    shutil.copy2(project, backup)
-    project.write_bytes(data)
+    backup = make_backup(project, "delete")
+    atomic_write(project, data)
     return {"deleted": sorted(names), "channels": remaining, "backup": str(backup)}
 
 
@@ -190,8 +187,6 @@ def add_sampler_channels(project: Path, samplers: list[tuple[str, str]]) -> dict
     expected = before + [n for n, _ in samplers]
     if after != expected:
         raise ValueError(f"verification failed: {after}")
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    backup = project.with_name(f"{project.stem}.before-sampler-{stamp}.flp")
-    shutil.copy2(project, backup)
-    project.write_bytes(data)
+    backup = make_backup(project, "sampler")
+    atomic_write(project, data)
     return {"channels": after, "backup": str(backup)}

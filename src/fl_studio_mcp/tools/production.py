@@ -43,13 +43,11 @@ def bisect(i, s, p, target):
 
 def register_production_tools(mcp: FastMCP) -> None:
     from fl_studio_mcp.utils.connection import get_connection
+    from fl_studio_mcp.utils.fl_exec import exec_in_fl
     from fl_studio_mcp.utils.fl_files import reopen_and_wait, save_project_and_locate
 
     def _exec(code: str, timeout: float = 10.0) -> Any:
-        reply = get_connection().send_command("debug.exec", {"code": code}, timeout=timeout)
-        if "result" not in reply:
-            raise RuntimeError(reply.get("error", "FL did not answer"))
-        return reply["result"]
+        return exec_in_fl(code, timeout=timeout)
 
     def _channel_names() -> list[str]:
         return _exec(

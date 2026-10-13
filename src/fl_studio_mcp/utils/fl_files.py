@@ -14,15 +14,21 @@ import re
 import shutil
 import struct
 import subprocess
+import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
+from fl_studio_mcp.utils.backups import BACKUP_DIR, in_backup_dir, is_backup_name
 from fl_studio_mcp.utils.flp_events import read_events, write_events
 
-EV_CH_NEW, EV_CH_TYPE = 64, 21
+EV_CH_NEW, EV_CH_TYPE, EV_CH_END, EV_INSERT = 64, 21, 51, 236
 EV_VERSION, EV_PLUGIN_NAME, EV_CH_NAME, EV_WRAPPER, EV_STATE = 199, 201, 203, 212, 213
 # Header of an FL channel preset (FLhd chunk: format, channel count, PPQ).
 FST_HEADER = b"FLhd" + struct.pack("<IHHH", 6, 0x30, 2, 0x30)
+# Every save -> edit -> reload sequence (and other multi-step FL operations) holds
+# this lock: FastMCP runs tool calls concurrently in worker threads.
+EDIT_LOCK = threading.RLock()
 
 
 def user_data_dir() -> Path:
@@ -68,48 +74,109 @@ def open_in_fl(path: Path) -> None:
         raise RuntimeError(f"Opening files in FL Studio is not supported on {system}")
 
 
+_last_project: Path | None = None
+
+
+def remember_project(path: Path) -> None:
+    """Remember the project FL has open, so the next save finds it without searching."""
+    global _last_project
+    _last_project = Path(path)
+
+
+def _mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _search_roots() -> list[tuple[Path, int]]:
+    """Folders to look for a freshly saved project in, with how deep to look."""
+    home = Path.home()
+    roots = [(Path(p), 3) for p in os.environ.get("FL_PROJECT_DIRS", "").split(os.pathsep) if p]
+    roots += [
+        (user_data_dir() / "Projects", 3),
+        (user_data_dir(), 1),
+        (home / "Downloads", 1),
+        (home / "Desktop", 2),
+        (home / "Documents", 3),
+        (home, 2),
+    ]
+    return roots
+
+
+def _walk(root: Path, max_depth: int) -> Iterator[Path]:
+    """*.flp under `root`, skipping hidden folders, Library and Backup folders."""
+    for depth in range(max_depth + 1):
+        for p in root.glob("/".join(["*"] * depth + ["*.flp"])):
+            folders = p.relative_to(root).parts[:-1]
+            if any(f.startswith(".") or f in ("Library", BACKUP_DIR) for f in folders):
+                continue
+            yield p
+
+
 def find_project_file(window_title: str, saved_after: float) -> Path | None:
     """Find the project FL just saved.
 
     The scripting API doesn't expose the project path (and newer FL versions
     don't even put the file name in the title), so look for the newest .flp
-    written after `saved_after`, preferring one whose name matches the title.
+    written after `saved_after`: first the project found last time, then the
+    usual project folders. Backups are skipped unless nothing else matches.
     """
+    if _last_project is not None and _mtime(_last_project) >= saved_after:
+        return _last_project
     match = re.match(r"\s*(.+?\.flp)\b", window_title, re.IGNORECASE)
     wanted = match.group(1).lower() if match else None
-    roots = [Path(p) for p in os.environ.get("FL_PROJECT_DIRS", "").split(os.pathsep) if p]
-    roots += [user_data_dir() / "Projects", user_data_dir(), Path.home() / "Documents", Path.home()]
     hits: list[Path] = []
-    for root in roots:
-        if not root.is_dir():
-            continue
-        for depth in range(4):  # shallow search keeps this fast
-            for p in root.glob("/".join(["*"] * depth + ["*.flp"])):
-                if (
-                    "Backup" not in p.parts
-                    and ".before-delete-" not in p.name
-                    and p.stat().st_mtime >= saved_after
-                ):
-                    hits.append(p)
-        if hits:
-            break
+    for root, depth in _search_roots():
+        if root.is_dir():
+            hits = [p for p in _walk(root, depth) if _mtime(p) >= saved_after]
+            if hits:
+                break
     if wanted:
-        named = [p for p in hits if p.name.lower() == wanted]
-        hits = named or hits
-    return max(hits, key=lambda p: p.stat().st_mtime) if hits else None
+        hits = [p for p in hits if p.name.lower() == wanted] or hits
+    pool = [p for p in hits if not is_backup_name(p) and not in_backup_dir(p)] or hits
+    return max(pool, key=_mtime) if pool else None
+
+
+def project_warning(project: Path) -> str | None:
+    """A warning when the file FL has open is a backup rather than the real project."""
+    if is_backup_name(project) or in_backup_dir(project):
+        return (
+            f"FL has a backup file open ({project.name}), so edits go into it. Use "
+            "fl_restore_backup to put it back over the real project, or "
+            "fl_save_project_as to continue under a new name."
+        )
+    return None
+
+
+def channel_bounds(events: list[tuple[int, bytes]]) -> list[tuple[int, int]]:
+    """(start, end) event ranges of channel blocks, end exclusive, in channel order.
+
+    A block starts with ChNew + ChType and ends after its terminator (event 51)
+    or at the next block; the last block never runs into the mixer section.
+    Lenient on purpose: suitable for reading and patching single events.
+    """
+    starts = [
+        i for i in range(len(events) - 1)
+        if events[i][0] == EV_CH_NEW and events[i + 1][0] == EV_CH_TYPE
+    ]
+    out = []
+    for n, start in enumerate(starts):
+        limit = starts[n + 1] if n + 1 < len(starts) else next(
+            (i for i in range(start + 2, len(events)) if events[i][0] == EV_INSERT), len(events)
+        )
+        end = next((i + 1 for i in range(start + 2, limit) if events[i][0] == EV_CH_END), limit)
+        out.append((start, end))
+    return out
 
 
 def _channel_blocks(events: list[tuple[int, bytes]]) -> dict[int, list[tuple[int, bytes]]]:
-    """Map channel index -> its events (a channel block starts with ChNew + ChType)."""
-    blocks: dict[int, list[tuple[int, bytes]]] = {}
-    current: list[tuple[int, bytes]] | None = None
-    for i, (eid, val) in enumerate(events):
-        is_start = eid == EV_CH_NEW and i + 1 < len(events) and events[i + 1][0] == EV_CH_TYPE
-        if is_start:
-            current = blocks.setdefault(struct.unpack("<H", val)[0], [])
-        elif current is not None:
-            current.append((eid, val))
-    return blocks
+    """Map channel index -> its events after ChNew (ChType first)."""
+    return {
+        struct.unpack("<H", events[start][1])[0]: events[start + 1:end]
+        for start, end in channel_bounds(events)
+    }
 
 
 def snapshot_channel(project: Path, channel: int, out_path: Path, name: str) -> Path:
@@ -142,6 +209,7 @@ def save_project_and_locate(send_command, timeout: float = 10.0) -> Path:
         path = find_project_file(title, started)
         if path:
             time.sleep(0.5)  # let FL finish writing
+            remember_project(path)
             return path
         time.sleep(0.5)
     raise RuntimeError(
@@ -150,20 +218,28 @@ def save_project_and_locate(send_command, timeout: float = 10.0) -> Path:
     )
 
 
-_CAPTURE = """
-wins = {"mixer": midi.widMixer, "rack": midi.widChannelRack, "playlist": midi.widPlaylist,
-        "pianoroll": midi.widPianoRoll, "browser": midi.widBrowser}
-result = {"playing": transport.isPlaying(), "pos": transport.getSongPos(),
-          "mode": transport.getLoopMode(), "pattern": patterns.patternNumber(),
-          "windows": {k: ui.getVisible(w) for k, w in wins.items()}}
+# Before a reload the song position is parked on this tick; FL starts a freshly
+# loaded project at the beginning, so a different position means the reload is done.
+SENTINEL_TICKS = 7
+_WINDOWS = """wins = {"mixer": midi.widMixer, "rack": midi.widChannelRack,
+        "playlist": midi.widPlaylist, "pianoroll": midi.widPianoRoll, "browser": midi.widBrowser}
 """
+_CAPTURE = _WINDOWS + f"""
+result = {{"playing": transport.isPlaying(), "pos": transport.getSongPos(2),
+          "mode": transport.getLoopMode(), "pattern": patterns.patternNumber(),
+          "windows": {{k: ui.getVisible(w) for k, w in wins.items()}}}}
+transport.stop()
+transport.setSongPos({SENTINEL_TICKS}, 2)
+"""
+_PROBE = (
+    "result = [transport.getSongPos(2), "
+    "[channels.getChannelName(i, True) for i in range(channels.channelCount(1))]]"
+)
 
 
 def _restore_code(state: dict) -> str:
-    return f"""
+    return _WINDOWS + f"""
 st = {state!r}
-wins = {{"mixer": midi.widMixer, "rack": midi.widChannelRack, "playlist": midi.widPlaylist,
-         "pianoroll": midi.widPianoRoll, "browser": midi.widBrowser}}
 if transport.getLoopMode() != st["mode"]:
     transport.setLoopMode()
 patterns.jumpToPattern(st["pattern"])
@@ -172,38 +248,59 @@ for k, w in wins.items():
         ui.showWindow(w)
     elif ui.getVisible(w):
         ui.hideWindow(w)
-transport.setSongPos(st["pos"])
+transport.setSongPos(st["pos"], 2)
 if st["playing"] and not transport.isPlaying():
     transport.start()
 result = True
 """
 
 
-def reopen_and_wait(
-    send_command, project: Path, timeout: float = 20.0, expected: list[str] | None = None
-) -> bool:
-    """Reopen `project` in FL, wait for it, then restore what the user had going.
+def _exec_quiet(send_command, code: str, timeout: float = 2.0):
+    """debug.exec that treats errors and timeouts (FL busy loading) as None."""
+    try:
+        reply = send_command("debug.exec", {"code": code}, timeout=timeout)
+    except Exception:  # noqa: BLE001 - transport errors just mean "not answering yet"
+        return None
+    return reply.get("result") if isinstance(reply, dict) else None
 
-    Playback, song position, loop mode, current pattern and which main windows
-    were open are captured before the reload and put back afterwards, so a
-    file edit feels like an in-place update rather than the project closing.
-    `expected` defaults to the current channel list (edits that keep channels).
+
+def reopen_and_wait(
+    send_command,
+    project: Path,
+    timeout: float = 60.0,
+    expected: list[str] | None = None,
+    restore: bool = True,
+    grace: float = 8.0,
+) -> bool:
+    """Reopen `project` in FL, wait until it has really reloaded, then restore state.
+
+    Playback, song position (in ticks), loop mode, current pattern and which
+    main windows were open are captured before the reload and put back
+    afterwards, so a file edit feels like an in-place update. The reload is
+    detected by the parked song position changing (plus the channel list being
+    `expected`, default: unchanged); if the position never moves, the names
+    alone are trusted after `grace` seconds.
     """
-    state = send_command("debug.exec", {"code": _CAPTURE}).get("result")
-    names = expected if expected is not None else [
-        c["name"] for c in send_command("channels.getAll").get("channels", [])
-    ]
+    if expected is None:
+        probe = _exec_quiet(send_command, _PROBE)
+        expected = probe[1] if probe else None
+    state = _exec_quiet(send_command, _CAPTURE, timeout=5.0)
     open_in_fl(project)
-    deadline = time.time() + timeout
-    time.sleep(1.0)
-    while time.time() < deadline:
-        now = [c["name"] for c in send_command("channels.getAll").get("channels", [])]
-        if now == names:
-            time.sleep(1.0)  # let FL finish restoring plugin states
-            if state:
-                send_command("debug.exec", {"code": _restore_code(state)})
-            return True
+    started = time.time()
+    while time.time() - started < timeout:
         time.sleep(0.5)
+        probe = _exec_quiet(send_command, _PROBE)
+        if not probe:
+            continue
+        pos, names = probe
+        if expected is not None and names != expected:
+            continue
+        if pos != SENTINEL_TICKS or time.time() - started >= grace:
+            time.sleep(1.0)  # let FL finish restoring plugin states
+            if restore and state:
+                _exec_quiet(send_command, _restore_code(state), timeout=5.0)
+            remember_project(project)
+            return True
     return False
 
 

@@ -16,9 +16,9 @@ from __future__ import annotations
 
 import shutil
 import struct
-import time
 from pathlib import Path
 
+from fl_studio_mcp.utils.backups import atomic_write, make_backup
 from fl_studio_mcp.utils.flp_events import read_events, write_events
 
 EV_PLAYLIST = 233
@@ -66,10 +66,8 @@ def write_arrangement(project: Path, clips: list[tuple[int, int, int, int]]) -> 
     data = write_events(header, events)
     read_events(data)  # must still parse cleanly
 
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    backup = project.with_name(f"{project.stem}.before-arrange-{stamp}.flp")
-    shutil.copy2(project, backup)
-    project.write_bytes(data)
+    backup = make_backup(project, "arrange")
+    atomic_write(project, data)
     written = read_playlist(project)
     expected = [
         {"start": s, "pattern": p, "channel": None, "length": n, "track": t}

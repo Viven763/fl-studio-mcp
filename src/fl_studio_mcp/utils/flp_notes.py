@@ -17,11 +17,10 @@ position. Each note is 24 bytes:
 
 from __future__ import annotations
 
-import shutil
 import struct
-import time
 from pathlib import Path
 
+from fl_studio_mcp.utils.backups import atomic_write, make_backup
 from fl_studio_mcp.utils.flp_events import read_events, write_events
 
 EV_PAT_NEW, EV_PAT_NOTES = 65, 224
@@ -122,10 +121,8 @@ def write_parts(project: Path, parts: list[dict]) -> dict:
         if part.get("mode", "replace") == "replace" and have != mine:
             raise ValueError(f"verification failed for pattern {pat} channel {ch}; nothing written")
 
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    backup = project.with_name(f"{project.stem}.before-notes-{stamp}.flp")
-    shutil.copy2(project, backup)
-    project.write_bytes(data)
+    backup = make_backup(project, "notes")
+    atomic_write(project, data)
     return {
         "parts": [
             {"pattern": int(p["pattern"]), "channel": int(p["channel"]), "notes": len(p["notes"])}

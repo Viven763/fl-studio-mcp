@@ -37,10 +37,12 @@ class PianoRollTarget:
 
     # -- controller side -------------------------------------------------
     def _exec(self, code: str):
-        r = self.conn.send_command("debug.exec", {"code": code}, timeout=30)
-        if r.get("error"):
-            raise TargetError(r["error"])
-        return r.get("result")
+        from fl_studio_mcp.utils.fl_exec import exec_in_fl
+
+        try:
+            return exec_in_fl(code, timeout=30, send=self.conn.send_command)
+        except (RuntimeError, ValueError) as e:
+            raise TargetError(str(e)) from e
 
     def grid(self, channel: int, steps: int) -> set[int]:
         return set(self._exec(

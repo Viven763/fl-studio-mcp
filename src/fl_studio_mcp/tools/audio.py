@@ -22,12 +22,10 @@ result = {"playing": transport.isPlaying(), "pos": transport.getSongPos(2),
 
 def register_audio_tools(mcp: FastMCP) -> None:
     from fl_studio_mcp.utils.connection import get_connection
+    from fl_studio_mcp.utils.fl_exec import exec_in_fl
 
     def _exec(code: str, timeout: float = 5.0):
-        reply = get_connection().send_command("debug.exec", {"code": code}, timeout=timeout)
-        if "result" not in reply:
-            raise RuntimeError(reply.get("error", "FL did not answer"))
-        return reply["result"]
+        return exec_in_fl(code, timeout=timeout)
 
     @mcp.tool()
     def fl_analyze_audio(

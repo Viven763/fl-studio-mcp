@@ -175,15 +175,19 @@ class MIDIConnection:
         """Send one command over SysEx; None if no reply arrived in time."""
         import mido
 
+        payload = base64.b64encode(json.dumps(command).encode("utf-8"))
+        size = self.SYSEX_CHUNK
+        chunks = [payload[i:i + size] for i in range(0, len(payload), size)]
+        if len(chunks) > 127:  # chunk index/count are single 7-bit bytes
+            raise ValueError(
+                f"command too large for SysEx ({len(payload)} base64 bytes > {127 * size})"
+            )
         with self._lock:
             self._seq = (self._seq + 1) % 16384
             seq = self._seq
         with self._cond:
             self._pending.add(seq)
             self._replies.pop(seq, None)
-        payload = base64.b64encode(json.dumps(command).encode("utf-8"))
-        size = self.SYSEX_CHUNK
-        chunks = [payload[i:i + size] for i in range(0, len(payload), size)]
         for idx, chunk in enumerate(chunks or [b""]):
             meta = [self.DIR_REQUEST, (seq >> 7) & 0x7F, seq & 0x7F, idx, len(chunks)]
             head = self.SYSEX_HEADER + meta

@@ -16,9 +16,9 @@ from __future__ import annotations
 
 import shutil
 import struct
-import time
 from pathlib import Path
 
+from fl_studio_mcp.utils.backups import atomic_write, make_backup
 from fl_studio_mcp.utils.fl_files import fl_install_dirs
 from fl_studio_mcp.utils.flp_events import read_events, write_events
 
@@ -108,10 +108,8 @@ def add_effects(project: Path, effects: list[tuple[int, int, str]]) -> dict:
 
     data = write_events(header, events)
     read_events(data)
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    backup = project.with_name(f"{project.stem}.before-fx-{stamp}.flp")
-    shutil.copy2(project, backup)
-    project.write_bytes(data)
+    backup = make_backup(project, "fx")
+    atomic_write(project, data)
     placed = list_slots(project)
     for insert, slot, plugin in effects:
         if placed.get(insert, {}).get(slot, "").lower() != plugin.lower():
