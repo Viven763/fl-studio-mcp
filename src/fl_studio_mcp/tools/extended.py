@@ -9,9 +9,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from fl_studio_mcp.utils.fl_files import (
+    EDIT_LOCK,
     create_project,
     fl_install_dirs,
     open_in_fl,
+    project_warning,
     reopen_and_wait,
     save_project_and_locate,
     snapshot_channel,
@@ -314,15 +316,18 @@ def register_extended_tools(mcp: FastMCP) -> None:
         }
 
     @mcp.tool()
-    def fl_read_notes(pattern: int, channel: int | None = None) -> dict:
+    def fl_read_notes(pattern: int, channel: int | None = None, raw: bool = False) -> dict:
         """Read the notes of a pattern (optionally one channel) from the project.
 
         Saves the project first and reads the .flp, so it sees every channel at
-        once without opening any window. Times/durations are in beats.
+        once without opening any window. Times/durations are in beats; notes
+        also report slide/group/color when set.
 
         Args:
             pattern: Pattern number (1-based)
             channel: Optional channel index to filter
+            raw: Include each note's 24 raw bytes (hex) so fl_write_parts can write
+                 it back without losing fields it doesn't understand
         """
         from fl_studio_mcp.utils.flp_notes import read_pattern_notes
 
@@ -330,48 +335,124 @@ def register_extended_tools(mcp: FastMCP) -> None:
             project = save_project_and_locate(get_connection().send_command)
         except RuntimeError as e:
             return {"error": str(e)}
-        notes = read_pattern_notes(project).get(pattern, [])
+        notes = read_pattern_notes(project, keep_raw=raw).get(pattern, [])
         if channel is not None:
             notes = [n for n in notes if n["channel"] == channel]
         return {"pattern": pattern, "count": len(notes), "notes": notes}
 
+    def _load_list(value: list | None, path: str | None, what: str) -> list:
+        import json
+
+        if path:
+            try:
+                value = json.loads(Path(path).expanduser().read_text())
+            except (OSError, ValueError) as e:
+                raise ValueError(f"cannot read {what} file: {e}") from e
+        if not value:
+            raise ValueError(f"give {what} or {what}_file")
+        return value
+
     @mcp.tool()
-    def fl_write_parts(parts: list[dict] | None = None, parts_file: str | None = None) -> dict:
+    def fl_write_parts(
+        parts: list[dict] | None = None,
+        parts_file: str | None = None,
+        defaults: dict | None = None,
+    ) -> dict:
         """Write notes into patterns, addressed explicitly by pattern + channel (any OS).
 
         Preferred way to compose: no piano roll, keystrokes or window focus.
         Saves the project, writes all parts into the .flp in one go (verified,
-        with a timestamped backup next to the project) and reopens it in FL.
+        with a backup in the project's Backup folder) and reopens it in FL.
+
+        Performance options (per part, or for all parts via `defaults`) are
+        applied in this order: strum, swing, legato, humanize, clip_beats.
+            "swing": 0.58 | {"amount": 0.58, "grid": 0.25}   # 0.5 straight .. 0.75;
+                     0.58 on 16ths delays the off-16ths by 0.04 beats
+            "legato": 0.06 | {"overlap": 0.06, "max_gap": 0.0}  # connect touching notes
+                     (found on the straight timing, so swung lines stay connected)
+            "humanize": {"timing": 0.006, "velocity": 0.04, "duration": 0.0, "seed": 7}
+                     # +/- beats, +/- velocity; seeded per pattern+channel, repeatable
+            "strum": 0.012 | {"step": 0.012, "direction": "up", "velocity_drop": 0.02}
+            "clip_beats": 32  # cut notes at the pattern end
 
         Args:
             parts: [{"pattern": 1, "channel": 5, "mode": "replace" | "add",
+                     "swing": 0.58, "legato": 0.06,
                      "notes": [{"midi": 69, "time": 0.0, "duration": 0.5,
                                 "velocity": 0.8, "pan": 0.0}]}]
-                   time/duration in beats (quarter notes); velocity 0-1;
-                   pan -1..1. "replace" swaps that channel's notes in that pattern.
+                   time/duration in beats (quarter notes); velocity 0-1; pan -1..1.
+                   Optional note fields: "slide": true (FL slide note), "fine"
+                   (-120..120, 10-cent steps), "release" (0-128), "mod_x"/"mod_y"
+                   (0-255), "raw" (hex from fl_read_notes(raw=True)).
+                   "replace" swaps that channel's notes in that pattern.
             parts_file: Path to a JSON file with the same list (for large arrangements)
+            defaults: Options for every part, e.g. {"swing": 0.58,
+                      "humanize": {"timing": 0.006, "velocity": 0.04, "seed": 7}}
         """
-        import json
-
         from fl_studio_mcp.utils.flp_notes import write_parts
 
-        if parts_file:
-            try:
-                parts = json.loads(Path(parts_file).expanduser().read_text())
-            except (OSError, ValueError) as e:
-                return {"error": f"cannot read parts_file: {e}"}
-        if not parts:
-            return {"error": "give parts or parts_file"}
         conn = get_connection()
-        try:
-            project = save_project_and_locate(conn.send_command)
-            result = write_parts(project, parts)
-        except (RuntimeError, ValueError, KeyError) as e:
-            return {"error": str(e)}
-        if not reopen_and_wait(conn.send_command, project):
-            warning = "FL did not confirm the reload; reopen the project manually"
-            return {**result, "warning": warning}
-        return {**result, "reloaded": True}
+        with EDIT_LOCK:
+            try:
+                parts = _load_list(parts, parts_file, "parts")
+                project = save_project_and_locate(conn.send_command)
+                result = write_parts(project, parts, defaults)
+            except (RuntimeError, ValueError, KeyError, TypeError) as e:
+                return {"error": str(e)}
+            result["reloaded"] = reopen_and_wait(conn.send_command, project)
+        if not result["reloaded"]:
+            result["warning"] = "FL did not confirm the reload; reopen the project manually"
+        if project_warning(project):
+            result["project_warning"] = project_warning(project)
+        return result
+
+    @mcp.tool()
+    def fl_transform_notes(
+        ops: list[dict] | None = None, ops_file: str | None = None, dry_run: bool = False
+    ) -> dict:
+        """Edit notes already in the project: copy/move/transpose/velocity/shift/delete/re-shape.
+
+        No need to resend whole parts: ops select notes in the saved file and
+        are applied in order, then the project is written once (verified,
+        backup in Backup/) and reopened. Untouched notes keep their exact bytes.
+
+        Every op names its selection: "pattern" and "channel" (a number, a list
+        or "all"), optionally "range": [from_beat, to_beat) and "keys": [lo, hi].
+        Ops:
+            {"op": "move", "pattern": "all", "channel": 10, "to_channel": 12}
+            {"op": "copy", "pattern": 5, "channel": 9, "to_pattern": 7,
+             "time_offset": 0, "transpose": -12, "velocity_scale": 0.8,
+             "mode": "add" | "replace"}   # replace clears the destination range first
+            {"op": "transpose", "pattern": 1, "channel": 6, "semitones": 2}
+            {"op": "velocity", "pattern": 3, "channel": [7, 9], "scale": 1.15, "add": 0}
+            {"op": "shift", "pattern": 1, "channel": 4, "beats": 0.02}
+            {"op": "delete", "pattern": 2, "channel": 3, "range": [28, 32]}
+            {"op": "swing", ..., "amount": 0.58, "grid": 0.25}
+            {"op": "humanize", ..., "timing": 0.006, "velocity": 0.04, "seed": 1}
+            {"op": "legato", ..., "overlap": 0.06, "max_gap": 0.0}
+            {"op": "strum", ..., "step": 0.012, "direction": "up"}
+
+        Args:
+            ops: List of ops as above
+            ops_file: Path to a JSON file with the list instead
+            dry_run: Only report what would change (counts per pattern/channel)
+        """
+        from fl_studio_mcp.utils.flp_notes import check_ops, transform_notes
+
+        conn = get_connection()
+        with EDIT_LOCK:
+            try:
+                ops = _load_list(ops, ops_file, "ops")
+                check_ops(ops)
+                project = save_project_and_locate(conn.send_command)
+                result = transform_notes(project, ops, dry_run=dry_run)
+            except (RuntimeError, ValueError, KeyError, TypeError) as e:
+                return {"error": str(e)}
+            if not dry_run:
+                result["reloaded"] = reopen_and_wait(conn.send_command, project)
+        if project_warning(project):
+            result["project_warning"] = project_warning(project)
+        return result
 
     @mcp.tool()
     def fl_new_project(name: str, save_current: bool = True) -> dict:
