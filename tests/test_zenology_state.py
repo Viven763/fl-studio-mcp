@@ -9,6 +9,7 @@ from fl_studio_mcp.utils.zenology import (
     _find_window,
     _numbers,
     _select_on_screen,
+    clean_title,
     describe_tone,
     parse_windows,
     pick_window,
@@ -186,3 +187,11 @@ def test_find_window_reports_other_desktop(monkeypatch, fake_send, quick):
     monkeypatch.setattr(zenology, "_activate_fl", lambda: None)
     with pytest.raises(ZenologyError, match="another desktop: \\['Violin \\(Master\\)'\\]"):
         _find_window("Violin", 3, fake_send(lambda a, p: {"success": True}))
+
+
+def test_fl_title_markers_are_ignored():
+    raw = "HrmnMute SRX\ue5a0 (Master)\ue5ff|158,200,474,258|1|0\n"
+    wins = parse_windows(raw)
+    assert wins == [("HrmnMute SRX (Master)", (158, 200, 474, 258), True)]
+    assert pick_window([(t, r) for t, r, _on in wins], "HrmnMute SRX") == (158, 200, 474, 258)
+    assert clean_title("  Krasota.flp  -  FL Studio 2026 ") == "Krasota.flp - FL Studio 2026"

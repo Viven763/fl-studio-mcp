@@ -22,6 +22,7 @@ import struct
 import subprocess
 import tempfile
 import time
+import unicodedata
 from collections.abc import Callable
 from pathlib import Path
 
@@ -146,10 +147,22 @@ def _osa(script: str) -> str:
     return proc.stdout.strip()
 
 
+FL_BUNDLE_ID = "com.image-line.flstudio"
+
+
 def _activate_fl() -> None:
-    """Bring FL to the front, switching to its desktop (Space) if it lives on another one."""
+    """Bring FL to the front, switching to its desktop (Space) if it lives on another one.
+
+    AppleScript's `activate` switches desktops; `open -a` (LaunchServices) only
+    makes FL the active app and leaves its windows on their own desktop.
+    """
+    try:
+        _osa(f'tell application id "{FL_BUNDLE_ID}" to activate')
+        return
+    except ZenologyError:
+        pass
     apps = sorted(Path("/Applications").glob("FL Studio*.app"), reverse=True)
-    cmd = ["open", "-a", str(apps[0])] if apps else ["open", "-b", "com.image-line.flstudio"]
+    cmd = ["open", "-a", str(apps[0])] if apps else ["open", "-b", FL_BUNDLE_ID]
     try:
         subprocess.run(cmd, capture_output=True, timeout=10)
     except (subprocess.TimeoutExpired, OSError):
@@ -193,6 +206,16 @@ def pick_window(windows: list[tuple[str, tuple]], channel_name: str) -> tuple | 
 Window = tuple[str, tuple[int, int, int, int], bool]  # title, (x, y, w, h), on screen
 
 
+def clean_title(title: str) -> str:
+    """A window title without FL's invisible glyph markers and doubled spaces.
+
+    FL decorates plugin window titles with private-use characters, e.g.
+    "Upright\\ue5a0 (Master)\\ue5ff"; they are dropped before matching names.
+    """
+    kept = "".join(ch for ch in title if unicodedata.category(ch) not in ("Co", "Cf", "Cc"))
+    return " ".join(kept.split())
+
+
 def parse_windows(text: str) -> list[Window]:
     """Parse `flhelper windows` output: "title|x,y,w,h|onscreen|layer" per line."""
     found = []
@@ -204,7 +227,7 @@ def parse_windows(text: str) -> list[Window]:
             x, y, w, h = (int(float(v)) for v in parts[1].split(","))
         except ValueError:
             continue
-        found.append((parts[0], (x, y, w, h), parts[2].strip() == "1"))
+        found.append((clean_title(parts[0]), (x, y, w, h), parts[2].strip() == "1"))
     return found
 
 
@@ -220,7 +243,7 @@ def _windows() -> list[Window]:
             return found
     except ZenologyError:
         pass
-    return [(title, rect, True) for title, rect in _windows_applescript()]
+    return [(clean_title(title), rect, True) for title, rect in _windows_applescript()]
 
 
 def _windows_applescript() -> list[tuple[str, tuple[int, int, int, int]]]:
