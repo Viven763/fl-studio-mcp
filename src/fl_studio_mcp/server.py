@@ -1,19 +1,16 @@
 """FL Studio MCP Server - Control FL Studio via Model Context Protocol.
 
-This MCP server provides tools to control FL Studio through two mechanisms:
-1. MIDI + JSON - Real-time control of mixer, transport, channels, and plugins
-2. Piano Roll Scripts - Persistent note placement via JSON + keystroke triggering
+Live control goes through the FLStudioMCP controller script (SysEx over a
+virtual MIDI port, with a debug.exec action for anything the command table
+lacks). What FL's scripting API can't do - notes in any pattern, playlist
+arrangement, stock effects, deleting channels, save as - is done by editing
+the saved project file (verified, backed up to Backup/) and reloading it.
 
 Requirements:
-- FL Studio 20.7+ running
-- FLStudioMCP controller script installed (run: ./scripts/setup_mac.sh)
+- FL Studio 2024+ (file edits assume the FL 2026 project layout)
+- FLStudioMCP controller script installed (run ./install.sh or scripts/setup.sh)
 - On Mac: IAC Driver enabled in Audio MIDI Setup
 - On Windows: loopMIDI virtual MIDI ports configured
-- For piano roll: ComposeWithLLM.pyscript installed in FL Studio
-
-Limitations:
-- Cannot load new plugins (only control existing ones)
-- Cannot create new patterns programmatically
 """
 
 from __future__ import annotations
@@ -38,23 +35,30 @@ from fl_studio_mcp.utils.connection import get_connection, reset_connection
 mcp = FastMCP(
     name="fl-studio-mcp",
     instructions="""
-FL Studio MCP Server - Control FL Studio from AI assistants.
+FL Studio MCP Server - control FL Studio (live, plus file-based edits of the saved project).
 
-This server provides tools to control FL Studio through its Python scripting API.
-FL Studio must be running with the FLStudioMCP MIDI controller enabled.
+Workflow guide:
+- Compose with fl_write_parts (pattern + channel addressed; options swing / humanize /
+  legato / strum, slide notes). Change existing notes with fl_transform_notes (copy/move
+  between channels and patterns, transpose, velocity, shift, delete) instead of
+  resending whole parts. Read with fl_read_notes.
+- Arrange with fl_arrange; name/create patterns with fl_set_pattern_names.
+- Mixer: fl_mixer_setup (routes, names, sends add/remove/exclusive, faders in dB) and
+  fl_get_mixer_routing to read it back. Effects: fl_add_effects, then
+  fl_set_effect_params (by number, name, or text label like "High pass").
+  Instruments: fl_find_plugin_params / fl_set_plugin_params.
+- Listen: fl_render_analyze (per section, optional bar window and mutes),
+  fl_render_stems (how loud each instrument really is), fl_live_levels.
+- Project files: fl_save_project_as, fl_open_project, fl_restore_backup (never keep
+  working inside a backup), fl_tidy_backups. Backups live in <project dir>/Backup/.
+- ZENOLOGY (macOS): fl_zenology_load verifies the loaded tone from the saved state;
+  fl_zenology_current_tone tells what a channel really holds.
 
-Available tool categories:
-- Transport: Play, stop, record, tempo, position control
-- Mixer: Volume, pan, mute, solo, track management
-- Channels: Channel info, note triggering, step sequencer
-- Plugins: Parameter control, preset navigation (cannot load new plugins)
-
-Important limitations:
-1. Cannot load new VST/AU plugins - only control existing ones
-2. Cannot create new patterns programmatically
-3. Note triggering (fl_trigger_note) is real-time only - notes won't persist
-   unless FL Studio is recording. Use step sequencer (fl_set_grid_bit) for
-   persistent drum patterns.
+Notes:
+- File-based tools save the project first and reload it; FL's undo history is cleared.
+- Stereo separation: negative = wider, positive = towards mono.
+- Send level 0.8 = unity (0 dB). Song position: fl_set_song_position(..., unit="bars").
+- fl_trigger_note is real-time only; nothing is recorded unless FL is recording.
 """,
 )
 

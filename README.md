@@ -95,7 +95,7 @@ https://github.com/user-attachments/assets/c2b1a5e7-1640-41fa-82bc-18ca7cbae9e8
 
 > **Cannot load plugins** — The FL Studio scripting API does not support loading new VST/AU plugins. You can only control parameters of plugins that are already loaded in your project.
 
-> **No pattern management (yet)** — The server can write notes and step-sequencer steps into a pattern, but it has no tools to create, switch, rename, or clone patterns. Everything goes into whichever pattern is currently selected in FL Studio, so pick or create the pattern yourself before asking for notes. (FL Studio's scripting API does support this through the `patterns` module, so it could be added.)
+> **Workarounds for API gaps** — What the scripting API can't do (writing notes into any pattern, arranging the playlist, adding stock effects, deleting channels, save as) is done by editing the saved project file and reloading it in FL. Those edits are verified, backed up to the project's `Backup/` folder, and clear FL's undo history. See [Production tools](#production-tools-local-extensions).
 
 ---
 
@@ -354,6 +354,66 @@ fl-studio-mcp
 | `fl_trigger_script` | Manually trigger the FL Studio script |
 | `fl_get_piano_roll_info` | Get piano roll system info |
 | `fl_clear_request_queue` | Cancel pending queued changes |
+
+### Production tools (local extensions)
+
+**Project files**
+
+| Tool | Description |
+|------|-------------|
+| `fl_save_project` | Save (Ctrl/Cmd+S) and return the file path |
+| `fl_save_project_as` | Save under a new name and switch FL to it (verified) |
+| `fl_open_project` | Open a project (saves the current one first; refuses backups) |
+| `fl_restore_backup` | Put a backup back over its project (with a safety copy) and open it |
+| `fl_tidy_backups` | Move old `*.before-*.flp` files next to a project into `Backup/` (dry run first) |
+| `fl_new_project` | New project file from FL's template |
+| `fl_delete_channels` | Delete channels by name or global index |
+| `fl_show_plugin_editor` / `fl_close_plugin_windows` | Show/hide plugin windows |
+
+**Notes and patterns** (file based: any pattern and channel, no piano roll)
+
+| Tool | Description |
+|------|-------------|
+| `fl_write_parts` | Write notes per pattern+channel; options `swing`, `humanize` (seeded), `legato`, `strum`, `clip_beats`; slide notes |
+| `fl_transform_notes` | Copy/move notes between channels/patterns, transpose, scale velocity, shift, delete, re-swing/humanize/legato |
+| `fl_read_notes` | Read a pattern's notes (optionally with raw bytes for lossless round trips) |
+| `fl_arrange` | Replace the playlist with pattern clips |
+| `fl_create_pattern`, `fl_select_pattern`, `fl_set_pattern_names` | Pattern management |
+
+**Mixer and plugins**
+
+| Tool | Description |
+|------|-------------|
+| `fl_mixer_setup` | Route channels, name inserts, add/remove/exclusive sends, faders in dB - one call, read back |
+| `fl_get_mixer_routing` | Which insert each channel feeds and every send with its level |
+| `fl_add_effects` | Add stock effects to empty mixer slots |
+| `fl_get_effect_params` / `fl_set_effect_params` | Effect parameters by index or name; set by value, displayed number or text label |
+| `fl_find_plugin_params` / `fl_set_plugin_params` | Same for instruments; search big plugins (ZENOLOGY) by name |
+
+**Sound and analysis** (background renders; the FL you work in is untouched)
+
+| Tool | Description |
+|------|-------------|
+| `fl_render`, `fl_render_analyze` | Render and analyse per playlist section; optional bar window and muted channels/inserts |
+| `fl_render_stems` | One render per channel or group: LUFS, loudness vs the mix, share of the mix, bands per stem |
+| `fl_analyze_audio`, `fl_compare_audio` | Analyse any file (or a time window) / compare with a reference |
+| `fl_live_levels` | Peak per mixer track while FL plays a window (meters settle first, no stale tails) |
+
+**Roland ZENOLOGY** (macOS; needs Screen Recording and Accessibility permissions)
+
+| Tool | Description |
+|------|-------------|
+| `fl_zenology_find` | Search installed tones |
+| `fl_zenology_load`, `fl_zenology_load_factory` | Load a tone as a new channel; corrects the selection and verifies it from the saved state |
+| `fl_zenology_current_tone` | The tone a channel really holds (names can lie) |
+
+**Conventions**
+
+- File-based edits save the project first, write a verified copy (atomic), keep a backup in `<project dir>/Backup/` and reload the project in FL, restoring playback position, loop mode, pattern and open windows. FL's undo history is cleared by the reload.
+- Stereo separation: negative = wider (-1 = 100% separated), positive = towards mono.
+- Send levels are FL's send knob: 0.8 = unity (0 dB), 1.0 = max.
+- `fl_render_stems` takes about a minute per stem; group channels to keep it short.
+- Song position: `fl_set_song_position(9, unit="bars")` (also seconds, ms, ticks, fraction).
 
 ---
 
