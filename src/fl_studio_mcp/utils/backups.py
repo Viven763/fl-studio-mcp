@@ -1,8 +1,11 @@
 """Backups written before every edit of a project file.
 
-They go to a "Backup" folder next to the project (where FL keeps its own
-backups too), so the project folder only holds the real project and the file
-FL has open is never mistaken for a backup. Nothing here deletes files.
+They go to "<project name> backups" next to the project, so the project folder
+only holds the real project, the file FL has open is never mistaken for a
+backup, and they never mix with other folders (a shared folder like Downloads
+may already have a "backup" folder; macOS doesn't tell "Backup" from "backup").
+Older versions wrote to "Backup/" or right next to the project; fl_tidy_backups
+moves those. Nothing here deletes files.
 """
 
 from __future__ import annotations
@@ -15,7 +18,8 @@ import tempfile
 import time
 from pathlib import Path
 
-BACKUP_DIR = "Backup"
+BACKUP_DIR = "Backup"  # FL's own backup folder name (older versions of these tools used it)
+BACKUP_SUFFIX = " backups"
 _TAG = re.compile(r"\.before-[a-z]+-\d{8}-\d{6}(?:-\d+)?$")
 
 
@@ -25,14 +29,24 @@ def is_backup_name(path: Path) -> bool:
     return ".before-" in name or "(autosaved on" in name or "(overwritten on" in name
 
 
+def is_backup_dir_name(name: str) -> bool:
+    low = name.lower()
+    return low == BACKUP_DIR.lower() or low.endswith(BACKUP_SUFFIX)
+
+
 def in_backup_dir(path: Path) -> bool:
-    return BACKUP_DIR in path.parts[:-1]
+    return any(is_backup_dir_name(part) for part in path.parts[:-1])
+
+
+def backup_dir(project: Path) -> Path:
+    """<project dir>/<project name> backups"""
+    return project.parent / f"{project.stem}{BACKUP_SUFFIX}"
 
 
 def backup_path(project: Path, tag: str, now: float | None = None) -> Path:
-    """<project dir>/Backup/<stem>.before-<tag>-<YYYYmmdd-HHMMSS>[-n].flp (never existing)."""
+    """<project name> backups/<stem>.before-<tag>-<YYYYmmdd-HHMMSS>[-n].flp (never existing)."""
     stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
-    folder = project.parent / BACKUP_DIR
+    folder = backup_dir(project)
     base = f"{project.stem}.before-{tag}-{stamp}"
     path = folder / f"{base}.flp"
     n = 2
@@ -43,7 +57,7 @@ def backup_path(project: Path, tag: str, now: float | None = None) -> Path:
 
 
 def make_backup(project: Path, tag: str) -> Path:
-    """Copy `project` into its Backup folder and return the copy's path."""
+    """Copy `project` into its backup folder and return the copy's path."""
     path = backup_path(project, tag)
     path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(project, path)
@@ -69,17 +83,32 @@ def original_for_backup(backup: Path) -> Path:
     match = _TAG.search(backup.stem)
     if not match:
         raise ValueError(f"not a backup written by these tools: {backup.name}")
-    folder = backup.parent.parent if backup.parent.name == BACKUP_DIR else backup.parent
+    folder = backup.parent.parent if is_backup_dir_name(backup.parent.name) else backup.parent
     return folder / f"{backup.stem[:match.start()]}.flp"
 
 
+def root_stem(backup: Path) -> str:
+    """Name of the project a (possibly nested) chain of backups started from."""
+    return backup.name.split(".before-", 1)[0]
+
+
 def list_backups(project: Path) -> list[Path]:
-    """Backups of `project` (Backup folder and legacy ones beside it), newest first."""
+    """Backups of `project` (current and older locations), newest first."""
     pattern = f"{glob.escape(project.stem)}.before-*.flp"
-    found = list((project.parent / BACKUP_DIR).glob(pattern)) + list(project.parent.glob(pattern))
+    found: set[Path] = set()
+    for folder in (backup_dir(project), project.parent / BACKUP_DIR, project.parent):
+        found.update(folder.glob(pattern))
     return sorted(found, key=lambda p: p.stat().st_mtime, reverse=True)
 
 
 def legacy_backups(folder: Path) -> list[Path]:
-    """Backups lying directly in a project folder (older versions wrote them there)."""
-    return sorted(p for p in folder.glob("*.flp") if _TAG.search(p.stem))
+    """Backups in the places older versions used: next to the projects and in Backup/.
+
+    Only files named like these tools' backups are listed; anything else in a
+    "Backup"/"backup" folder (FL's own copies, the user's files) is left alone.
+    """
+    found = [p for p in folder.glob("*.flp") if _TAG.search(p.stem)]
+    old = folder / BACKUP_DIR
+    if old.is_dir():
+        found += [p for p in old.glob("*.flp") if _TAG.search(p.stem)]
+    return sorted(found, key=lambda p: (p.name, str(p)))

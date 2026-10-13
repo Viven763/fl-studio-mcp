@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 def target_path(current: Path, name: str) -> Path:
     """Where "save as `name`" goes: absolute path, or next to the current project.
 
-    A current file inside a Backup folder counts as living in the project folder.
+    A current file inside a backup folder counts as living in the project folder.
     """
     from fl_studio_mcp.utils.backups import in_backup_dir
 
@@ -36,11 +36,13 @@ def target_path(current: Path, name: str) -> Path:
 def register_project_tools(mcp: FastMCP) -> None:
     from fl_studio_mcp.utils import fl_files
     from fl_studio_mcp.utils.backups import (
+        BACKUP_SUFFIX,
         in_backup_dir,
         is_backup_name,
         legacy_backups,
         make_backup,
         original_for_backup,
+        root_stem,
     )
     from fl_studio_mcp.utils.connection import get_connection
     from fl_studio_mcp.utils.fl_exec import exec_in_fl
@@ -160,7 +162,7 @@ def register_project_tools(mcp: FastMCP) -> None:
         inside the backup.
 
         Args:
-            backup: Path of a backup (<name>.before-<tag>-<time>.flp, usually in Backup/)
+            backup: Path of a backup (<name>.before-<tag>-<time>.flp, in "<name> backups/")
             save_current: Save the currently open project first if it has changes
         Returns {"restored_from", "project", "safety_backup", "loaded"}.
         """
@@ -190,15 +192,17 @@ def register_project_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def fl_tidy_backups(folder: str | None = None, dry_run: bool = True) -> dict:
-        """Move old backups (*.before-*.flp lying next to a project) into its Backup folder.
+        """Move old backups into "<project name> backups" folders next to the projects.
 
-        Never deletes anything and never moves the file FL has open. Run with
-        dry_run=True first to see the list.
+        Collects these tools' backups (*.before-*.flp) lying next to the projects
+        or in a "Backup" folder (where older versions put them). Other files in
+        those places are left alone. Never deletes anything and never moves the
+        file FL has open. Run with dry_run=True first to see the list.
 
         Args:
             folder: Project folder (default: the open project's folder)
             dry_run: Only list what would be moved
-        Returns {"folder", "backup_folder", "files": [names], "skipped", "dry_run"}.
+        Returns {"folder", "backup_folders", "files": [names], "skipped", "dry_run"}.
         """
         try:
             if folder:
@@ -217,17 +221,19 @@ def register_project_tools(mcp: FastMCP) -> None:
             if open_file is not None and p.resolve() == open_file.resolve():
                 skipped.append(f"{p.name} (open in FL)")
                 continue
-            dest = where / "Backup" / p.name
+            target = where / f"{root_stem(p)}{BACKUP_SUFFIX}"
+            dest = target / p.name
             n = 2
             while dest.exists():
-                dest = where / "Backup" / f"{p.stem}-{n}.flp"
+                dest = target / f"{p.stem}-{n}.flp"
                 n += 1
             moves.append((p, dest))
         if not dry_run:
-            (where / "Backup").mkdir(exist_ok=True)
             for src, dest in moves:
+                dest.parent.mkdir(exist_ok=True)
                 shutil.move(str(src), str(dest))
-        return {"folder": str(where), "backup_folder": str(where / "Backup"),
+        return {"folder": str(where),
+                "backup_folders": sorted({str(dest.parent) for _src, dest in moves}),
                 "files": [src.name for src, _dest in moves], "skipped": skipped,
                 "dry_run": dry_run}
 

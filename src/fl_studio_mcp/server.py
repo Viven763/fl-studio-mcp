@@ -4,7 +4,7 @@ Live control goes through the FLStudioMCP controller script (SysEx over a
 virtual MIDI port, with a debug.exec action for anything the command table
 lacks). What FL's scripting API can't do - notes in any pattern, playlist
 arrangement, stock effects, deleting channels, save as - is done by editing
-the saved project file (verified, backed up to Backup/) and reloading it.
+the saved project file (verified, backed up to "<project> backups/") and reloading it.
 
 Requirements:
 - FL Studio 2024+ (file edits assume the FL 2026 project layout)
@@ -14,6 +14,8 @@ Requirements:
 """
 
 from __future__ import annotations
+
+import os
 
 from fastmcp import FastMCP
 
@@ -50,7 +52,8 @@ Workflow guide:
 - Listen: fl_render_analyze (per section, optional bar window and mutes),
   fl_render_stems (how loud each instrument really is), fl_live_levels.
 - Project files: fl_save_project_as, fl_open_project, fl_restore_backup (never keep
-  working inside a backup), fl_tidy_backups. Backups live in <project dir>/Backup/.
+  working inside a backup), fl_tidy_backups. Backups live in "<project name> backups/"
+  next to the project.
 - ZENOLOGY (macOS): fl_zenology_load verifies the loaded tone from the saved state;
   fl_zenology_current_tone tells what a channel really holds.
 
@@ -148,7 +151,8 @@ register_transport_tools(mcp)
 register_mixer_tools(mcp)
 register_channel_tools(mcp)
 register_plugin_tools(mcp)
-register_piano_roll_tools(mcp)
+if os.environ.get("FL_MCP_PIANO_ROLL"):  # keystroke-driven; fl_write_parts replaces it
+    register_piano_roll_tools(mcp)
 register_extended_tools(mcp)
 register_audio_tools(mcp)
 register_production_tools(mcp)

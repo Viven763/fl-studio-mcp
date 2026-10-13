@@ -6,9 +6,11 @@ from fl_studio_mcp.utils import zenology
 from fl_studio_mcp.utils.zenology import (
     STATE_TEMPLATE,
     ZenologyError,
+    _find_window,
     _numbers,
     _select_on_screen,
     describe_tone,
+    parse_windows,
     pick_window,
     plan_clicks,
     read_tone_from_state,
@@ -151,3 +153,36 @@ def test_far_off_reading_stops_clicking(fake_send, quick):
         find_window=lambda: (0, 0, 1, 1),
     )
     assert clicks == ["prev"] and res["verified"] and res["verified_by"] == "state"
+
+
+def test_parse_helper_windows():
+    text = "Sad S.VlnSRX 3 (Master)|158,200,474,258|0|0\n|0,0,1728,33|1|26\nbad line\n"
+    assert parse_windows(text) == [
+        ("Sad S.VlnSRX 3 (Master)", (158, 200, 474, 258), False),
+        ("", (0, 0, 1728, 33), True),
+    ]
+
+
+def test_find_window_switches_to_fl_desktop(monkeypatch, fake_send, quick):
+    state = {"on": False, "activations": 0}
+
+    def windows():
+        return [("Krasota.flp - FL Studio 2026", (0, 33, 1728, 1084), state["on"]),
+                ("Violin (Master)", (158, 200, 474, 258), state["on"])]
+
+    def activate():
+        state["activations"] += 1
+        state["on"] = True
+
+    monkeypatch.setattr(zenology, "_windows", windows)
+    monkeypatch.setattr(zenology, "_activate_fl", activate)
+    rect = _find_window("Violin", 3, fake_send(lambda a, p: {"success": True}))
+    assert rect == (158, 200, 474, 258) and state["activations"] == 1
+
+
+def test_find_window_reports_other_desktop(monkeypatch, fake_send, quick):
+    monkeypatch.setattr(zenology, "_windows",
+                        lambda: [("Violin (Master)", (1, 2, 3, 4), False)])
+    monkeypatch.setattr(zenology, "_activate_fl", lambda: None)
+    with pytest.raises(ZenologyError, match="another desktop: \\['Violin \\(Master\\)'\\]"):
+        _find_window("Violin", 3, fake_send(lambda a, p: {"success": True}))

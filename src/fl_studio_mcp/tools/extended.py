@@ -334,7 +334,7 @@ def register_extended_tools(mcp: FastMCP) -> None:
         FL's scripting API can't delete channels, so this saves the project,
         cuts the channels out of the .flp (remapping pattern notes and playlist
         clips to the new channel numbers), keeps a backup in the project's
-        Backup folder and reloads it in FL (position, pattern, windows kept).
+        backup folder and reloads it in FL (position, pattern, windows kept).
         A name shared by several channels is refused with their indices.
 
         Args:
@@ -406,7 +406,7 @@ def register_extended_tools(mcp: FastMCP) -> None:
 
         Preferred way to compose: no piano roll, keystrokes or window focus.
         Saves the project, writes all parts into the .flp in one go (verified,
-        with a backup in the project's Backup folder) and reopens it in FL.
+        with a backup in "<project name> backups") and reopens it in FL.
 
         Performance options (per part, or for all parts via `defaults`) are
         applied in this order: strum, swing, legato, humanize, clip_beats.
@@ -458,7 +458,7 @@ def register_extended_tools(mcp: FastMCP) -> None:
 
         No need to resend whole parts: ops select notes in the saved file and
         are applied in order, then the project is written once (verified,
-        backup in Backup/) and reopened. Untouched notes keep their exact bytes.
+        backup kept) and reopened. Untouched notes keep their exact bytes.
 
         Every op names its selection: "pattern" and "channel" (a number, a list
         or "all"), optionally "range": [from_beat, to_beat) and "keys": [lo, hi].

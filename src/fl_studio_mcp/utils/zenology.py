@@ -146,10 +146,24 @@ def _osa(script: str) -> str:
     return proc.stdout.strip()
 
 
+def _activate_fl() -> None:
+    """Bring FL to the front, switching to its desktop (Space) if it lives on another one."""
+    apps = sorted(Path("/Applications").glob("FL Studio*.app"), reverse=True)
+    cmd = ["open", "-a", str(apps[0])] if apps else ["open", "-b", "com.image-line.flstudio"]
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=10)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+
 def _front_is_fl() -> bool:
+    _activate_fl()
+    time.sleep(1.2)  # the switch to FL's fullscreen desktop is animated
     events = 'tell application "System Events" to '
+    if _osa(events + "get name of first process whose frontmost is true") == "OsxFL":
+        return True
     _osa(events + 'tell process "OsxFL" to set frontmost to true')
-    time.sleep(1.0)  # FL may live in its own fullscreen Space
+    time.sleep(1.0)
     return _osa(events + "get name of first process whose frontmost is true") == "OsxFL"
 
 
@@ -176,7 +190,40 @@ def pick_window(windows: list[tuple[str, tuple]], channel_name: str) -> tuple | 
     return loose[0] if len(loose) == 1 else None
 
 
-def _windows() -> list[tuple[str, tuple[int, int, int, int]]]:
+Window = tuple[str, tuple[int, int, int, int], bool]  # title, (x, y, w, h), on screen
+
+
+def parse_windows(text: str) -> list[Window]:
+    """Parse `flhelper windows` output: "title|x,y,w,h|onscreen|layer" per line."""
+    found = []
+    for line in text.splitlines():
+        parts = line.split("|")
+        if len(parts) < 3:
+            continue
+        try:
+            x, y, w, h = (int(float(v)) for v in parts[1].split(","))
+        except ValueError:
+            continue
+        found.append((parts[0], (x, y, w, h), parts[2].strip() == "1"))
+    return found
+
+
+def _windows() -> list[Window]:
+    """FL's windows from the WindowServer list (every desktop), else from System Events.
+
+    System Events only reports windows on the visible desktop, so it sees nothing
+    while FL runs fullscreen on its own Space; the WindowServer list always does.
+    """
+    try:
+        found = parse_windows(_run([str(_helper()), "windows", "FL Studio"]).stdout)
+        if found:
+            return found
+    except ZenologyError:
+        pass
+    return [(title, rect, True) for title, rect in _windows_applescript()]
+
+
+def _windows_applescript() -> list[tuple[str, tuple[int, int, int, int]]]:
     """(title, (x, y, w, h)) of FL's windows on the visible Space."""
     out = _osa(
         'tell application "System Events" to tell process "OsxFL"\n'
@@ -368,21 +415,27 @@ def _open_fst(fst: Path, send_command) -> int:
 
 
 def _find_window(name: str, channel: int, send_command) -> tuple[int, int, int, int]:
-    seen: list[tuple[str, tuple]] = []
-    for attempt in range(24):  # macOS only lists windows of the visible Space; give FL a moment
+    """The plugin window's rect once it is on screen (clicks go to screen coordinates)."""
+    seen: list[Window] = []
+    for attempt in range(30):
         seen = _windows()
-        rect = pick_window(seen, name)
+        rect = pick_window([(t, r) for t, r, on in seen if on], name)
         if rect:
             return rect
-        if attempt in (8, 16):  # FL sometimes loads the plugin without showing its window
+        exists = pick_window([(t, r) for t, r, _on in seen], name) is not None
+        if exists and attempt % 6 == 5:
+            _activate_fl()  # it is there, but on FL's desktop: switch to it again
+        if not exists and attempt in (8, 16):  # FL sometimes loads the plugin without its window
             for show in (0, 1):
                 code = f"channels.showEditor({channel}, {show}, True)\nresult = 1"
                 send_command("debug.exec", {"code": code})
                 time.sleep(0.5)
         time.sleep(0.5)
-    titles = [t for t, _r in seen][:12]
+    shown = [t for t, _r, on in seen if on and t][:10]
+    hidden = [t for t, _r, on in seen if not on and t][:10]
     raise ZenologyError(
-        f"ZENOLOGY window for channel {channel} ({name!r}) not found; FL windows seen: {titles}"
+        f"ZENOLOGY window for channel {channel} ({name!r}) is not on screen. FL windows on "
+        f"screen: {shown}; on another desktop: {hidden}. Show FL's desktop and retry."
     )
 
 

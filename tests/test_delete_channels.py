@@ -12,7 +12,7 @@ def test_delete_by_index_with_duplicate_names(template_flp):
     res = delete_channels(template_flp, indices=[2], live_names=LIVE)
     assert res["deleted"] == [{"index": 2, "name": "Upright"}]
     assert res["channels"] == ["Kick", "Upright", "Snare", "Synth"]
-    assert "Backup" in res["backup"]
+    assert "Song backups" in res["backup"]
     assert [n["channel"] for n in read_pattern_notes(template_flp)[1]] == [2]  # remapped 3 -> 2
 
 

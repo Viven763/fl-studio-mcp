@@ -19,10 +19,10 @@ def _no_cached_project(monkeypatch):
     monkeypatch.setattr(fl_files, "_last_project", None)
 
 
-def test_backup_path_in_backup_dir(tmp_path):
+def test_backup_path_in_project_backup_dir(tmp_path):
     project = tmp_path / "Song.flp"
     path = backup_path(project, "notes", now=0)
-    assert path.parent == tmp_path / "Backup"
+    assert path.parent == tmp_path / "Song backups"
     assert path.name.startswith("Song.before-notes-") and path.suffix == ".flp"
 
 
@@ -39,6 +39,8 @@ def test_backup_unique_same_second(tmp_path):
 def test_original_for_backup_nested_and_legacy(tmp_path):
     inside = tmp_path / "Backup" / "Song.before-notes-20261013-190000.flp"
     assert original_for_backup(inside) == tmp_path / "Song.flp"
+    current = tmp_path / "Song backups" / "Song.before-fx-20261014-010000-2.flp"
+    assert original_for_backup(current) == tmp_path / "Song.flp"
     legacy = tmp_path / "Song.before-arrange-20261011-224511-2.flp"
     assert original_for_backup(legacy) == tmp_path / "Song.flp"
     nested = tmp_path / "Song.before-notes-20261011-224511.before-delete-20261013-192716.flp"
@@ -50,7 +52,12 @@ def test_original_for_backup_nested_and_legacy(tmp_path):
 def test_legacy_backups_lists_only_tool_backups(tmp_path):
     for name in ("Song.flp", "Song.before-fx-20261011-195006.flp", "Other.flp"):
         (tmp_path / name).write_bytes(b"x")
-    assert [p.name for p in legacy_backups(tmp_path)] == ["Song.before-fx-20261011-195006.flp"]
+    old = tmp_path / "backup"  # an unrelated user folder that older versions wrote into
+    old.mkdir()
+    for name in ("Song.before-notes-20261014-001916.flp", "app.mv.db", "Song (overwritten).flp"):
+        (old / name).write_bytes(b"x")
+    names = sorted(p.name for p in legacy_backups(tmp_path))
+    assert names == ["Song.before-fx-20261011-195006.flp", "Song.before-notes-20261014-001916.flp"]
 
 
 def _touch(path: Path, when: float) -> Path:

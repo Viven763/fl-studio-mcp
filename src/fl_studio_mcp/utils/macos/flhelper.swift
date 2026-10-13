@@ -1,6 +1,9 @@
 // Tiny macOS helper for UI steps the FL scripting API can't do.
 //   flhelper click X Y        left-click at screen point
 //   flhelper ocr IMAGE        print recognized text lines
+//   flhelper windows OWNER    print "title|x,y,w,h|onscreen|layer" for each window of apps whose
+//                             name starts with OWNER (WindowServer list: sees every desktop/Space,
+//                             titles need the Screen Recording permission)
 import AppKit
 import Foundation
 import Vision
@@ -23,7 +26,19 @@ case "ocr":
     req.usesLanguageCorrection = false
     try VNImageRequestHandler(cgImage: cg).perform([req])
     for obs in req.results ?? [] { if let t = obs.topCandidates(1).first { print(t.string) } }
+case "windows":
+    let owner = args.count > 2 ? args[2] : "FL Studio"
+    let opts: CGWindowListOption = [.optionAll, .excludeDesktopElements]
+    let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] ?? []
+    for w in list {
+        guard let name = w[kCGWindowOwnerName as String] as? String, name.hasPrefix(owner) else { continue }
+        let title = (w[kCGWindowName as String] as? String ?? "").replacingOccurrences(of: "|", with: "/")
+        let b = w[kCGWindowBounds as String] as? [String: Double] ?? [:]
+        let on = (w[kCGWindowIsOnscreen as String] as? Bool) ?? false
+        let layer = w[kCGWindowLayer as String] as? Int ?? 0
+        print("\(title)|\(Int(b["X"] ?? 0)),\(Int(b["Y"] ?? 0)),\(Int(b["Width"] ?? 0)),\(Int(b["Height"] ?? 0))|\(on ? 1 : 0)|\(layer)")
+    }
 default:
-    FileHandle.standardError.write("usage: flhelper click X Y | ocr IMAGE\n".data(using: .utf8)!)
+    FileHandle.standardError.write("usage: flhelper click X Y | ocr IMAGE | windows OWNER\n".data(using: .utf8)!)
     exit(1)
 }

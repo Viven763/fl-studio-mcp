@@ -12,7 +12,8 @@ def test_all_tools_register_with_descriptions():
 
     tools = asyncio.run(mcp.list_tools())
     names = [t.name for t in tools]
-    assert len(names) == len(set(names)) >= 100
+    assert len(names) == len(set(names)) >= 90
+    assert "fl_send_notes" not in names  # keystroke-driven piano roll tools are opt-in
     missing = [t.name for t in tools if not (t.description or "").strip()]
     assert not missing
     for new in ("fl_transform_notes", "fl_render_stems", "fl_get_mixer_routing",

@@ -111,10 +111,18 @@ def test_tidy_dry_run_then_move(box, tmp_path, monkeypatch):
     for name in ("Song.before-fx-20261011-195006.flp", "Song.before-notes-20261011-224511.flp"):
         (folder / name).write_bytes(b"x")
     monkeypatch.setattr(fl_files, "_last_project", folder / "Song.before-notes-20261011-224511.flp")
+    (folder / "Backup").mkdir(exist_ok=True)
+    (folder / "Backup" / "Song.before-notes-20261014-001916.flp").write_bytes(b"x")
+    (folder / "Backup" / "keep.db").write_bytes(b"x")
     dry = box.tools["fl_tidy_backups"](str(folder))
-    assert dry["files"] == ["Song.before-fx-20261011-195006.flp"]
+    assert dry["files"] == ["Song.before-fx-20261011-195006.flp",
+                            "Song.before-notes-20261014-001916.flp"]
+    assert dry["backup_folders"] == [str(folder / "Song backups")]
     assert dry["skipped"] and dry["dry_run"]
     assert (folder / "Song.before-fx-20261011-195006.flp").exists()
     done = box.tools["fl_tidy_backups"](str(folder), dry_run=False)
-    assert (folder / "Backup" / "Song.before-fx-20261011-195006.flp").exists()
+    moved = folder / "Song backups"
+    assert (moved / "Song.before-fx-20261011-195006.flp").exists()
+    assert (moved / "Song.before-notes-20261014-001916.flp").exists()
+    assert (folder / "Backup" / "keep.db").exists()  # not ours: untouched
     assert not (folder / "Song.before-fx-20261011-195006.flp").exists() and not done["dry_run"]

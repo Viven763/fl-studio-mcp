@@ -43,7 +43,7 @@ def test_slide_can_be_cleared():
 def test_write_parts_replace_add_verified(template_flp):
     first = [{"midi": 60 + i, "time": i, "duration": 0.5} for i in range(4)]
     res = write_parts(template_flp, [{"pattern": 1, "channel": 2, "notes": first}])
-    assert "Backup" in res["backup"]
+    assert "Song backups" in res["backup"]
     write_parts(template_flp, [
         {"pattern": 1, "channel": 2, "mode": "add", "notes": [{"midi": 70, "time": 8,
                                                                "duration": 1}]},

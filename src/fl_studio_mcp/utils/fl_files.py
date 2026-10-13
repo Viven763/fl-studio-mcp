@@ -19,7 +19,7 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 
-from fl_studio_mcp.utils.backups import BACKUP_DIR, in_backup_dir, is_backup_name
+from fl_studio_mcp.utils.backups import in_backup_dir, is_backup_dir_name, is_backup_name
 from fl_studio_mcp.utils.flp_events import read_events, write_events
 
 EV_CH_NEW, EV_CH_TYPE, EV_CH_END, EV_INSERT = 64, 21, 51, 236
@@ -110,7 +110,8 @@ def _walk(root: Path, max_depth: int) -> Iterator[Path]:
     for depth in range(max_depth + 1):
         for p in root.glob("/".join(["*"] * depth + ["*.flp"])):
             folders = p.relative_to(root).parts[:-1]
-            if any(f.startswith(".") or f in ("Library", BACKUP_DIR) for f in folders):
+            if any(f.startswith(".") or f == "Library" or is_backup_dir_name(f)
+                   for f in folders):
                 continue
             yield p
 
@@ -212,6 +213,12 @@ def save_project_and_locate(send_command, timeout: float = 10.0) -> Path:
             remember_project(path)
             return path
         time.sleep(0.5)
+    if _last_project is not None and _last_project.exists():
+        raise RuntimeError(
+            f"FL did not write {_last_project.name} within {timeout:.0f} s. FL is probably "
+            "showing a dialog (e.g. a Save panel, possibly on FL's own desktop): close it in "
+            "FL, then retry."
+        )
     raise RuntimeError(
         "Saved, but could not find the project file. Is the project saved to disk yet? "
         "Otherwise set FL_PROJECT_DIRS to its folder."

@@ -95,7 +95,7 @@ https://github.com/user-attachments/assets/c2b1a5e7-1640-41fa-82bc-18ca7cbae9e8
 
 > **Cannot load plugins** — The FL Studio scripting API does not support loading new VST/AU plugins. You can only control parameters of plugins that are already loaded in your project.
 
-> **Workarounds for API gaps** — What the scripting API can't do (writing notes into any pattern, arranging the playlist, adding stock effects, deleting channels, save as) is done by editing the saved project file and reloading it in FL. Those edits are verified, backed up to the project's `Backup/` folder, and clear FL's undo history. See [Production tools](#production-tools-local-extensions).
+> **Workarounds for API gaps** — What the scripting API can't do (writing notes into any pattern, arranging the playlist, adding stock effects, deleting channels, save as) is done by editing the saved project file and reloading it in FL. Those edits are verified, backed up to a `<project name> backups/` folder next to the project, and clear FL's undo history. See [Production tools](#production-tools-local-extensions).
 
 ---
 
@@ -365,7 +365,7 @@ fl-studio-mcp
 | `fl_save_project_as` | Save under a new name and switch FL to it (verified) |
 | `fl_open_project` | Open a project (saves the current one first; refuses backups) |
 | `fl_restore_backup` | Put a backup back over its project (with a safety copy) and open it |
-| `fl_tidy_backups` | Move old `*.before-*.flp` files next to a project into `Backup/` (dry run first) |
+| `fl_tidy_backups` | Move older backups (next to a project or in `Backup/`) into `<project name> backups/` (dry run first) |
 | `fl_new_project` | New project file from FL's template |
 | `fl_delete_channels` | Delete channels by name or global index |
 | `fl_show_plugin_editor` / `fl_close_plugin_windows` | Show/hide plugin windows |
@@ -409,11 +409,16 @@ fl-studio-mcp
 
 **Conventions**
 
-- File-based edits save the project first, write a verified copy (atomic), keep a backup in `<project dir>/Backup/` and reload the project in FL, restoring playback position, loop mode, pattern and open windows. FL's undo history is cleared by the reload.
+- File-based edits save the project first, write a verified copy (atomic), keep a backup in `<project name> backups/` next to the project and reload the project in FL, restoring playback position, loop mode, pattern and open windows. FL's undo history is cleared by the reload.
 - Stereo separation: negative = wider (-1 = 100% separated), positive = towards mono.
 - Send levels are FL's send knob: 0.8 = unity (0 dB), 1.0 = max.
 - `fl_render_stems` takes about a minute per stem; group channels to keep it short.
 - Song position: `fl_set_song_position(9, unit="bars")` (also seconds, ms, ticks, fraction).
+- ZENOLOGY loading switches to FL's desktop (also when FL runs fullscreen on its own Space) and only
+  clicks once the plugin window is on screen; keep hands off the mouse for ~10 s.
+- The keystroke-driven piano-roll tools (`fl_send_notes` etc.) are off by default; set
+  `FL_MCP_PIANO_ROLL=1` in the server's environment to enable them. Prefer `fl_write_parts`.
+- FL commands are sent one at a time; a command arriving while FL saves can stall FL.
 
 ---
 
