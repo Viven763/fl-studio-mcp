@@ -15,11 +15,15 @@ import struct
 from pathlib import Path
 
 from fl_studio_mcp.utils.backups import atomic_write, make_backup
+from fl_studio_mcp.utils.fl_files import channel_bounds
 from fl_studio_mcp.utils.flp_events import read_events, write_events
 
 EV_CH_NEW, EV_CH_TYPE, EV_CH_END = 64, 21, 51
 EV_CH_NAME, EV_PLUGIN_NAME = 203, 201
 EV_PAT_NOTES, EV_PAT_CTRL, EV_PLAYLIST = 224, 223, 233
+EV_CH_ENABLED, EV_INSERT = 0, 236
+CH_TYPE_AUTOMATION = 5
+INSERT_ENABLED = 0x08
 NOTE_SIZE, NOTE_CH_OFFSET = 24, 6
 CTRL_SIZE, CTRL_CH_OFFSET = 12, 6
 PATTERN_BASE = 20480  # playlist item indices >= this are patterns, below are channels
@@ -49,6 +53,59 @@ def channel_names(events: list[tuple[int, bytes]]) -> list[str]:
             raw = next((v for e, v in events[start:end] if e == EV_PLUGIN_NAME), b"")
         names.append(raw.decode("utf-16-le", "replace").rstrip("\x00"))
     return names
+
+
+def channel_types(events: list[tuple[int, bytes]]) -> list[int]:
+    """Channel type per channel: 0 sampler, 2 plugin, 3 layer, 4 audio clip, 5 automation."""
+    return [events[start + 1][1][0] for start, _end in channel_bounds(events)]
+
+
+def channel_enabled(events: list[tuple[int, bytes]]) -> list[bool]:
+    """Whether each channel is switched on (FL's per-channel mute, event 0 in its block)."""
+    out = []
+    for start, end in channel_bounds(events):
+        val = next((v for e, v in events[start:end] if e == EV_CH_ENABLED), b"\x01")
+        out.append(val[:1] != b"\x00")
+    return out
+
+
+def set_channels_enabled(
+    events: list[tuple[int, bytes]], keep: set[int], always_on_types: tuple[int, ...] = (5,)
+) -> list[tuple[int, bytes]]:
+    """Copy of `events` where only channels in `keep` (and automation clips) are switched on.
+
+    Only the enabled event inside each channel block is touched (a block
+    without one gets it); the project-level event 0 before the blocks is not.
+    """
+    out = list(events)
+    types = channel_types(events)
+    for ch, (start, end) in reversed(list(enumerate(channel_bounds(events)))):
+        on = ch in keep or types[ch] in always_on_types
+        val = b"\x01" if on else b"\x00"
+        hit = next((i for i in range(start, end) if out[i][0] == EV_CH_ENABLED), None)
+        if hit is None:
+            out.insert(start + 2, (EV_CH_ENABLED, val))
+        else:
+            out[hit] = (EV_CH_ENABLED, val)
+    return out
+
+
+def set_inserts_enabled(
+    events: list[tuple[int, bytes]], enabled: dict[int, bool]
+) -> list[tuple[int, bytes]]:
+    """Copy of `events` with mixer inserts switched on/off (0 = master)."""
+    out = list(events)
+    inserts = [i for i, (e, _v) in enumerate(out) if e == EV_INSERT]
+    for track, on in enabled.items():
+        if not 0 <= track < len(inserts):
+            raise ValueError(f"mixer insert {track} is not stored in this project")
+        i = inserts[track]
+        data = bytearray(out[i][1])
+        flags = struct.unpack_from("<I", data, 4)[0]
+        flags = flags | INSERT_ENABLED if on else flags & ~INSERT_ENABLED
+        struct.pack_into("<I", data, 4, flags)
+        out[i] = (EV_INSERT, bytes(data))
+    return out
 
 
 def _remap_records(

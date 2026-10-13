@@ -22,6 +22,7 @@ BANDS = [
     (2500, 6000, "high_mid"),
     (6000, 20000, "air"),
 ]
+BAND_EDGES = {name: [lo, hi] for lo, hi, name in BANDS}
 # Krumhansl-Kessler key profiles
 MAJOR = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
 MINOR = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
@@ -86,6 +87,13 @@ def lufs(x: np.ndarray, sr: int) -> float:
     rel = -0.691 + 10 * np.log10(keep.mean()) - 10
     keep = z[(lk > -70) & (lk > rel)]
     return round(float(-0.691 + 10 * np.log10(keep.mean())), 1) if len(keep) else float("-inf")
+
+
+def energy_k(x: np.ndarray, sr: int) -> float:
+    """K-weighted mean square (both channels summed): loudness-like energy for shares."""
+    if not len(x):
+        return 0.0
+    return float((_k_weight(x, sr) ** 2).mean(axis=0).sum())
 
 
 def balance(x: np.ndarray, sr: int) -> dict:
@@ -259,38 +267,52 @@ def analyze(
     bpm: float | None = None,
     sections: list[dict] | None = None,
     grid_start: float | None = None,
+    start: float | None = None,
+    end: float | None = None,
 ) -> dict:
-    """Full report. sections: [{"name", "start", "end"}] in seconds (optional)."""
+    """Full report. sections: [{"name", "start", "end"}] in seconds (optional).
+
+    With start/end (seconds) only that window is analysed; section and grid
+    times stay absolute (seconds from the start of the file).
+    """
     x, sr = load(path)
+    total = len(x) / sr
+    t0 = max(0.0, float(start or 0.0))
+    t1 = min(total, float(end)) if end is not None else total
+    if t1 - t0 < 0.5:
+        raise ValueError(f"window {t0:.1f}-{t1:.1f} s is too short (file is {total:.1f} s)")
+    x = x[int(t0 * sr):int(t1 * sr)]
     mono = x.mean(axis=1)
     t = tempo(mono, sr)
     bpm = bpm or t["bpm"]
     report = {
         "file": str(path),
-        "duration_s": round(len(x) / sr, 1),
+        "duration_s": round(total, 1),
+        "window": {"start": round(t0, 2), "end": round(t1, 2)},
         "lufs": lufs(x, sr),
         **balance(x, sr),
+        "band_edges_hz": BAND_EDGES,
         "tempo": t,
         **key(mono, sr),
     }
     if sections:
         report["sections"] = []
         for s in sections:
-            a, b = int(s["start"] * sr), int(s["end"] * sr)
-            if b - a < sr // 2:
+            a, b = max(float(s["start"]), t0), min(float(s["end"]), t1)
+            if b - a < 0.5:
                 continue
-            seg = x[a:b]
+            seg = x[int((a - t0) * sr):int((b - t0) * sr)]
             report["sections"].append(
                 {
                     "name": s["name"],
-                    "start": round(s["start"], 1),
-                    "end": round(s["end"], 1),
+                    "start": round(a, 1),
+                    "end": round(b, 1),
                     "lufs": lufs(seg, sr),
                     **balance(seg, sr),
                 }
             )
     if bpm:
-        loudest = grid_start
+        loudest = None if grid_start is None else max(0.0, grid_start - t0)
         if loudest is None:  # analyse the densest part of the track
             win = int(8 * 60 / bpm * sr)
             rms = [
@@ -299,8 +321,9 @@ def analyze(
             ]
             loudest = float(np.argmax(rms) * win / sr) if rms else 0.0
         dg = drum_grid(mono, sr, bpm, loudest)
-        report["drum_grid"] = dg
         report["sub_notes_8ths"] = sub_notes(mono, sr, bpm, dg["bar_start_s"], beats=16)
+        dg["bar_start_s"] = round(dg["bar_start_s"] + t0, 3)
+        report["drum_grid"] = dg
     return report
 
 

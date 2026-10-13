@@ -17,9 +17,13 @@ import shutil
 import subprocess
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from fl_studio_mcp.utils.fl_files import fl_install_dirs
+from fl_studio_mcp.utils.flp_events import read_events, write_events
+
+EventPatch = Callable[[list[tuple[int, bytes]]], list[tuple[int, bytes]]]
 
 
 def _fl_executable() -> Path:
@@ -35,13 +39,35 @@ def _fl_executable() -> Path:
     raise RuntimeError("FL Studio executable not found")
 
 
-def render_project(project: Path, timeout: float = 600.0) -> Path:
-    """Render a saved `project` to <project folder>/<name>.render.wav in the background."""
+def render_project(
+    project: Path,
+    timeout: float = 600.0,
+    out: Path | None = None,
+    patch: EventPatch | None = None,
+) -> Path:
+    """Render a saved `project` in the background and return the WAV.
+
+    The copy that gets rendered can be changed first with `patch` (a function
+    on the project's events, e.g. muting channels); the project itself is never
+    touched. Default output: <project folder>/<name>.render.wav.
+    """
     work = Path(tempfile.mkdtemp(prefix="flrender_"))
+    try:
+        return _render(project, work, timeout, out, patch)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _render(project: Path, work: Path, timeout: float, out: Path | None,
+            patch: EventPatch | None) -> Path:
     if " " in str(work):
         raise RuntimeError(f"temp folder contains spaces: {work}")
     src = work / "render.flp"
-    shutil.copy2(project, src)
+    if patch is None:
+        shutil.copy2(project, src)
+    else:
+        header, events = read_events(project.read_bytes())
+        src.write_bytes(write_events(header, patch(events)))
     flags = ["-R", "-Ewav"] if platform.system() == "Darwin" else ["/R", "/Ewav"]
     proc = subprocess.Popen([str(_fl_executable()), *flags, str(src)], cwd=work,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -70,7 +96,7 @@ def render_project(project: Path, timeout: float = 600.0) -> Path:
                 proc.wait(10)
             except subprocess.TimeoutExpired:
                 proc.kill()
-    out = project.with_name(f"{project.stem}.render.wav")
+    out = out or project.with_name(f"{project.stem}.render.wav")
+    out.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(wav), out)
-    shutil.rmtree(work, ignore_errors=True)
     return out

@@ -53,6 +53,30 @@ def read_playlist(project: Path) -> list[dict]:
     return items
 
 
+def sections_from_playlist(
+    project: Path, pattern_names: dict[int, str], bpm: float
+) -> list[dict]:
+    """Song sections in seconds from the playlist's pattern clips (one tempo assumed).
+
+    Clips covering exactly the same span (several tracks) become one section
+    with their names joined by " + ".
+    """
+    header, _ = read_events(project.read_bytes())
+    sec = 60.0 / bpm / struct.unpack_from("<H", header, 12)[0]
+    spans: dict[tuple[int, int], list[str]] = {}
+    for c in sorted(read_playlist(project), key=lambda c: (c["start"], c["track"])):
+        if c["pattern"] is None:
+            continue
+        name = pattern_names.get(c["pattern"], f"Pattern {c['pattern']}")
+        names = spans.setdefault((c["start"], c["start"] + c["length"]), [])
+        if name not in names:
+            names.append(name)
+    return [
+        {"name": " + ".join(names), "start": a * sec, "end": b * sec}
+        for (a, b), names in sorted(spans.items())
+    ]
+
+
 def write_arrangement(project: Path, clips: list[tuple[int, int, int, int]]) -> dict:
     """clips: (pattern, start_tick, length_ticks, track). Replaces the playlist."""
     header, events = read_events(project.read_bytes())
