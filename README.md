@@ -399,13 +399,16 @@ fl-studio-mcp
 | `fl_analyze_audio`, `fl_compare_audio` | Analyse any file (or a time window) / compare with a reference |
 | `fl_live_levels` | Peak per mixer track while FL plays a window (meters settle first, no stale tails) |
 
-**Roland ZENOLOGY** (macOS; needs Screen Recording and Accessibility permissions)
+**Roland ZENOLOGY** (its library is encrypted; tones are reused from saved states)
 
 | Tool | Description |
 |------|-------------|
-| `fl_zenology_find` | Search installed tones |
-| `fl_zenology_load`, `fl_zenology_load_factory` | Load a tone as a new channel; corrects the selection and verifies it from the saved state |
+| `fl_zenology_find` | Search installed tones; `in_library` = loads/swaps from file |
+| `fl_zenology_library` | The tone library: every tone ZENOLOGY played in a saved project/preset, one preset each (FL browser: Channel presets > MCP Snapshots > ZENOLOGY) |
+| `fl_zenology_load` | Add a tone as a new channel - from the library with FL in the background; a never-seen tone needs `allow_screen=true` once (FL in front, mouse ~10 s, macOS), then it joins the library |
+| `fl_zenology_set_tone` | Change the tone of an existing ZENOLOGY channel by editing the project file (keeps notes, routing, mono/legato) |
 | `fl_zenology_current_tone` | The tone a channel really holds (names can lie) |
+| `fl_zenology_load_factory` | Factory banks by number (screen only, `allow_screen=true`) |
 
 **Conventions**
 
@@ -414,8 +417,9 @@ fl-studio-mcp
 - Send levels are FL's send knob: 0.8 = unity (0 dB), 1.0 = max.
 - `fl_render_stems` takes about a minute per stem; group channels to keep it short.
 - Song position: `fl_set_song_position(9, unit="bars")` (also seconds, ms, ticks, fraction).
-- ZENOLOGY loading switches to FL's desktop (also when FL runs fullscreen on its own Space) and only
-  clicks once the plugin window is on screen; keep hands off the mouse for ~10 s.
+- Files are handed to FL in the background (`open -g`): keyboard focus and the visible desktop stay
+  with the user. Only the one-time on-screen ZENOLOGY pick (`allow_screen=true`) brings FL forward
+  (AppleScript `activate`, which also switches desktops) and clicks once the window is on screen.
 - The keystroke-driven piano-roll tools (`fl_send_notes` etc.) are off by default; set
   `FL_MCP_PIANO_ROLL=1` in the server's environment to enable them. Prefer `fl_write_parts`.
 - FL commands are sent one at a time; a command arriving while FL saves can stall FL.

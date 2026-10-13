@@ -54,8 +54,10 @@ Workflow guide:
 - Project files: fl_save_project_as, fl_open_project, fl_restore_backup (never keep
   working inside a backup), fl_tidy_backups. Backups live in "<project name> backups/"
   next to the project.
-- ZENOLOGY (macOS): fl_zenology_load verifies the loaded tone from the saved state;
-  fl_zenology_current_tone tells what a channel really holds.
+- ZENOLOGY: tones in the library (fl_zenology_find "in_library", fl_zenology_library) load
+  (fl_zenology_load) or swap on an existing channel (fl_zenology_set_tone) from file, without
+  screen or mouse. Never-seen tones need allow_screen=true once - ask the user first, since FL
+  takes the screen and mouse for ~10 s. fl_zenology_current_tone tells what a channel holds.
 
 Notes:
 - File-based tools save the project first and reload it; FL's undo history is cleared.
