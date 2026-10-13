@@ -211,17 +211,74 @@ def register_extended_tools(mcp: FastMCP) -> None:
         """
         return _send("plugins.getPresetNames", {"index": channel})
 
+    def _pick_tone(name: str, pack: str | None) -> tuple[dict | None, dict | None]:
+        """(tone, None) for a unique match, else (None, error dict)."""
+        from fl_studio_mcp.utils.zenology import find_tones
+
+        matches = [t for t in find_tones(name, 50) if pack is None or t["pack"] == pack]
+        if not matches:
+            return None, {"error": f"No ZENOLOGY tone matches '{name}'"}
+        if len({(t["pack"], t["no"]) for t in matches}) > 1:
+            exact = [t for t in matches if t["name"].lower() == name.lower()]
+            if len({(t["pack"], t["no"]) for t in exact}) != 1:
+                return None, {"error": "Ambiguous tone name; pass pack", "candidates": matches[:15]}
+            matches = exact
+        return matches[0], None
+
     @mcp.tool()
     def fl_zenology_find(query: str, limit: int = 20) -> dict:
         """Search installed Roland ZENOLOGY tones by name and/or category.
+
+        "in_library": true means the tone loads/swaps from file (no screen or
+        mouse); others need one on-screen load (fl_zenology_load allow_screen).
 
         Args:
             query: e.g. "tenor sax", "SoftSaxesSRX", "pad dark", "E.Piano"
             limit: Maximum number of results
         """
-        from fl_studio_mcp.utils.zenology import find_tones
+        from fl_studio_mcp.utils.zenology import find_tones, library_index
 
-        return {"tones": find_tones(query, limit)}
+        index = library_index()
+        tones = find_tones(query, limit)
+        for t in tones:
+            t["in_library"] = (t["pack_id"], t["no"]) in index
+        return {"tones": tones}
+
+    @mcp.tool()
+    def fl_zenology_library(query: str | None = None, rescan: bool = False) -> dict:
+        """The ZENOLOGY tone library: tones that load and swap from file, without the screen.
+
+        Built from every saved project and preset where ZENOLOGY played a tone
+        (verified against the tone index); tones loaded on screen are added
+        automatically. FL's browser shows them under Channel presets > MCP
+        Snapshots > ZENOLOGY.
+
+        Args:
+            query: Optional filter on name/pack/category
+            rescan: Look through project files and presets for new tones first
+        Returns {"tones": [{"pack", "number", "name", "category"}], "count", "added"?}.
+        """
+        from fl_studio_mcp.utils.zenology import (
+            describe_tone,
+            harvest,
+            harvest_sources,
+            library_index,
+        )
+
+        added = harvest(harvest_sources())["added"] if rescan else None
+        rows = []
+        for (pack_id, number), _path in sorted(library_index().items()):
+            info = describe_tone({"pack_id": pack_id, "number": number, "name": ""})
+            row = {"pack": info.get("pack"), "number": number,
+                   "name": info.get("listed_name"), "category": info.get("category")}
+            text = " ".join(str(v) for v in row.values()).lower()
+            if query and not all(w in text for w in query.lower().split()):
+                continue
+            rows.append(row)
+        out = {"tones": rows, "count": len(rows)}
+        if added is not None:
+            out["added"] = added
+        return out
 
     def _zen_state_reader():
         from fl_studio_mcp.utils.zenology import channel_tone
@@ -259,58 +316,121 @@ def register_extended_tools(mcp: FastMCP) -> None:
                 "matches_channel_name": matches}
 
     @mcp.tool()
-    def fl_zenology_load(name: str, pack: str | None = None) -> dict:
-        """Load a ZENOLOGY library tone by name as a NEW channel (macOS).
+    def fl_zenology_load(name: str, pack: str | None = None, allow_screen: bool = False) -> dict:
+        """Load a ZENOLOGY tone by name as a NEW channel.
 
-        ZENOLOGY can't switch tones via host presets or MIDI, so this presses
-        its tone arrow and corrects until the right number shows (up to 5
-        clicks), then checks the tone FL saved for the new channel
-        (verified_by "state"; the project is saved for that). FL must be
-        visible; don't touch the mouse (~6-10 s). Needs Screen Recording and
-        Accessibility permissions for the app running this server.
+        Tones in the tone library load from file: no screen, mouse or keyboard,
+        FL stays in the background. A tone ZENOLOGY never loaded anywhere has
+        to be picked on screen once (macOS): only with allow_screen=true, FL
+        comes to the front and the mouse is used for ~10 s (tone arrow pressed
+        and corrected, then verified from the saved state); the tone is then
+        added to the library. Use fl_zenology_set_tone to change the tone of an
+        existing channel instead of adding one.
 
         Args:
             name: Tone name from fl_zenology_find (exact match preferred)
             pack: Optional pack folder to disambiguate, e.g. "EXZ008_VintKeys"
-        Returns {"channel", "channel_name", "verified", "verified_by", "clicks",
-        "loaded": {"pack_id", "number", "name"}}; if not verified, the new channel
-        holds a different tone - delete it with fl_delete_channels(indices=[channel]).
+            allow_screen: Allow the one-time on-screen load for tones not in the library
+        Returns {"channel", "channel_name", "source": "library"|"screen", "verified",
+        "verified_by", "clicks", "loaded": {"pack_id", "number", "name"}}.
         """
         import subprocess
 
-        from fl_studio_mcp.utils.zenology import ZenologyError, find_tones, load_tone
+        from fl_studio_mcp.utils.zenology import (
+            ZenologyError,
+            harvest,
+            library_tone,
+            load_from_library,
+            load_tone,
+        )
 
-        matches = [t for t in find_tones(name, 50) if pack is None or t["pack"] == pack]
-        if not matches:
-            return {"error": f"No ZENOLOGY tone matches '{name}'"}
-        if len(matches) > 1 and len({(t["pack"], t["no"]) for t in matches}) > 1:
-            exact = [t for t in matches if t["name"].lower() == name.lower()]
-            if len(exact) != 1:
-                return {"error": "Ambiguous tone name", "candidates": matches[:15]}
-            matches = exact
-        if platform.system() != "Darwin":
-            return {
-                "error": "fl_zenology_load is macOS-only. Pick the tone in ZENOLOGY once, "
-                "then use fl_save_channel_preset / fl_load_preset."
-            }
+        tone, problem = _pick_tone(name, pack)
+        if problem:
+            return problem
+        send = get_connection().send_command
         with EDIT_LOCK:
             try:
-                return load_tone(matches[0], get_connection().send_command, _zen_state_reader())
-            except (ZenologyError, subprocess.SubprocessError, OSError) as e:
+                if library_tone(tone) is not None:
+                    return load_from_library(tone, send, _zen_state_reader())
+                if not allow_screen:
+                    return {
+                        "error": f"{tone['name']} ({tone['pack']} #{tone['no']}) is not in the "
+                        "tone library: ZENOLOGY never loaded it in any saved project. Loading it "
+                        "once needs FL on screen and the mouse for ~10 s (call again with "
+                        "allow_screen=true); after that it loads from file.",
+                        "in_library": False,
+                    }
+                if platform.system() != "Darwin":
+                    return {"error": "on-screen loading is macOS-only"}
+                result = load_tone(tone, send, _zen_state_reader())
+                if result.get("verified"):
+                    added = harvest([save_project_and_locate(send)])["added"]
+                    result["added_to_library"] = bool(added)
+                result["source"] = "screen"
+                return result
+            except (ZenologyError, subprocess.SubprocessError, OSError, RuntimeError) as e:
                 return {"error": str(e)}
 
     @mcp.tool()
-    def fl_zenology_load_factory(bank: str, number: int, name: str | None = None) -> dict:
+    def fl_zenology_set_tone(
+        channel: int, name: str, pack: str | None = None, rename: bool = False
+    ) -> dict:
+        """Change the tone of an existing ZENOLOGY channel, from file (no screen or mouse).
+
+        The channel keeps its index, notes, mixer routing, effects and its
+        mono/legato/portamento settings; only the sound changes. The tone must
+        be in the tone library (see fl_zenology_find "in_library"). One reload,
+        backup kept.
+
+        Args:
+            channel: Channel index (global) holding ZENOLOGY
+            name: Tone name, e.g. "Mute Tp SRX"
+            pack: Optional pack folder to disambiguate
+            rename: Also rename the channel to the tone name
+        Returns {"channel", "from", "to", "renamed", "backup", "reloaded"}.
+        """
+        from fl_studio_mcp.utils.fl_exec import exec_in_fl
+        from fl_studio_mcp.utils.zenology import ZenologyError, library_tone, set_channel_tone
+
+        tone, problem = _pick_tone(name, pack)
+        if problem:
+            return problem
+        send = get_connection().send_command
+        with EDIT_LOCK:
+            try:
+                if library_tone(tone) is None:
+                    return {"error": f"{tone['name']} is not in the tone library; load it once "
+                            "with fl_zenology_load(allow_screen=true)", "in_library": False}
+                live = exec_in_fl("result = [channels.getChannelName(c, True) "
+                                  "for c in range(channels.channelCount(1))]")
+                project = save_project_and_locate(send)
+                result = set_channel_tone(project, channel, tone,
+                                          rename=tone["name"] if rename else None)
+                expected = list(live)
+                if result["renamed"] and 0 <= channel < len(expected):
+                    expected[channel] = result["renamed"]
+                result["reloaded"] = reopen_and_wait(send, project, expected=expected)
+            except (ZenologyError, RuntimeError, ValueError, OSError) as e:
+                return {"error": str(e)}
+        return result
+
+    @mcp.tool()
+    def fl_zenology_load_factory(
+        bank: str, number: int, name: str | None = None, allow_screen: bool = False
+    ) -> dict:
         """Load a built-in ZENOLOGY factory tone by bank and number as a NEW channel (macOS).
 
         Factory banks (PRST_A Factory Presets ... PRST_L Essential 2) have no name
         list on disk, so the tone is addressed by the number ZENOLOGY shows
-        (e.g. bank "PRST_F", number 605); pack and number are verified.
+        (e.g. bank "PRST_F", number 605); pack and number are verified. This
+        always needs the screen: FL comes to the front and the mouse is used
+        for ~10 s, so it only runs with allow_screen=true.
 
         Args:
             bank: "PRST_F" or just "F"
             number: Tone number as displayed in ZENOLOGY's browser
             name: Optional channel name, e.g. "Polysynth 1"
+            allow_screen: Confirm that FL may take the screen and mouse for ~10 s
         """
         import subprocess
 
@@ -318,6 +438,9 @@ def register_extended_tools(mcp: FastMCP) -> None:
 
         if platform.system() != "Darwin":
             return {"error": "fl_zenology_load_factory is macOS-only"}
+        if not allow_screen:
+            return {"error": "factory tones are picked on screen (FL in front, mouse ~10 s); "
+                    "call again with allow_screen=true"}
         with EDIT_LOCK:
             try:
                 return load_factory_tone(bank, number, get_connection().send_command, name,

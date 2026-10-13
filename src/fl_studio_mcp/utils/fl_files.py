@@ -57,12 +57,17 @@ def fl_install_dirs() -> list[Path]:
     return []
 
 
-def open_in_fl(path: Path) -> None:
-    """Hand a file to the running FL Studio, like double-clicking it in the OS."""
+def open_in_fl(path: Path, background: bool = True) -> None:
+    """Hand a file to the running FL Studio, like double-clicking it in the OS.
+
+    On macOS FL stays in the background by default, so the keyboard focus and
+    the visible desktop stay wherever the user is.
+    """
     system = platform.system()
     if system == "Darwin":
         apps = sorted(Path("/Applications").glob("FL Studio*.app"), reverse=True)
-        cmd = ["open", "-a", str(apps[0]), str(path)] if apps else ["open", str(path)]
+        flags = ["-g"] if background else []
+        cmd = ["open", *flags, "-a", str(apps[0]), str(path)] if apps else ["open", str(path)]
         subprocess.run(cmd, check=True, timeout=10)
     elif system == "Windows":
         exes = [d / "FL64.exe" for d in fl_install_dirs() if (d / "FL64.exe").exists()]
@@ -180,23 +185,35 @@ def _channel_blocks(events: list[tuple[int, bytes]]) -> dict[int, list[tuple[int
     }
 
 
+def preset_from_block(
+    version: bytes, block: list[tuple[int, bytes]], name: str, state: bytes | None = None
+) -> bytes:
+    """An FL channel preset (.fst) made of a channel block's plugin events.
+
+    `state` replaces the block's own plugin state (event 213) when given.
+    """
+    first: dict[int, bytes] = {}
+    for eid, val in block:
+        first.setdefault(eid, val)
+    state = state if state is not None else first.get(EV_STATE)
+    if state is None:
+        raise ValueError("channel has no plugin state (sampler/empty channel?)")
+    preset = [(EV_VERSION, version), (28, b"\x01")]
+    preset += [(eid, first[eid]) for eid in (EV_PLUGIN_NAME, EV_WRAPPER) if eid in first]
+    preset += [(EV_CH_NAME, (name + "\0").encode("utf-16-le")), (EV_STATE, state)]
+    return write_events(FST_HEADER, preset)
+
+
 def snapshot_channel(project: Path, channel: int, out_path: Path, name: str) -> Path:
     """Write channel `channel` of a saved project as a standalone .fst preset."""
     _, events = read_events(project.read_bytes())
     block = _channel_blocks(events).get(channel)
     if block is None:
         raise ValueError(f"channel {channel} not found in {project.name}")
-    first = {}
-    for eid, val in block:
-        first.setdefault(eid, val)
-    if EV_STATE not in first:
-        raise ValueError(f"channel {channel} has no plugin state (sampler/empty channel?)")
     version = next((v for e, v in events if e == EV_VERSION), b"")
-    preset = [(EV_VERSION, version), (28, b"\x01")]
-    preset += [(eid, first[eid]) for eid in (EV_PLUGIN_NAME, EV_WRAPPER) if eid in first]
-    preset += [(EV_CH_NAME, (name + "\0").encode("utf-16-le")), (EV_STATE, first[EV_STATE])]
+    data = preset_from_block(version, block, name)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_bytes(write_events(FST_HEADER, preset))
+    out_path.write_bytes(data)
     return out_path
 
 

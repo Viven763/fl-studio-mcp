@@ -1,21 +1,24 @@
-"""Load Roland ZENOLOGY tones into FL Studio by name (macOS).
+"""Roland ZENOLOGY tones in FL Studio: read, load and swap them by name.
 
-ZENOLOGY ignores MIDI program changes and exposes no host presets, so tones
-are selected like this:
+ZENOLOGY ignores MIDI program changes, exposes no host presets and keeps its
+tone library encrypted. But every saved ZENOLOGY state carries the complete
+tone it plays, so a tone ZENOLOGY has loaded once can be reused as a file:
 
-1. Build an FL channel preset (.fst) from a saved ZENOLOGY state whose
-   "current tone" reference points at the target pack/number. ZENOLOGY only
-   uses that reference for its prev/next arrows - the sound itself comes from
-   the stored tone data.
-2. Load the .fst (FL opens it as a new channel and shows the plugin window).
-3. Press the tone arrow once, which makes ZENOLOGY load the neighbouring tone
-   from its library for real.
-4. OCR the plugin window to confirm the tone name, then close the window.
+- The tone library (Channel presets > MCP Snapshots > ZENOLOGY) holds one
+  channel preset per tone, harvested from saved projects and presets. Loading
+  a tone from it, or swapping the tone of an existing channel (a project-file
+  edit), needs no screen, mouse or keyboard.
+- Only a tone ZENOLOGY has never loaded anywhere needs the screen once
+  (macOS): build an .fst whose "current tone" reference points next to the
+  target, load it, press ZENOLOGY's tone arrow (correcting until the right
+  number shows), verify the tone from the saved state, add it to the library.
 """
 
 from __future__ import annotations
 
+import functools
 import json
+import os
 import plistlib
 import re
 import struct
@@ -23,10 +26,10 @@ import subprocess
 import tempfile
 import time
 import unicodedata
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
-from fl_studio_mcp.utils.fl_files import open_in_fl, user_data_dir
+from fl_studio_mcp.utils.fl_files import open_in_fl, snapshot_dir, user_data_dir
 from fl_studio_mcp.utils.flp_events import read_events, write_events
 
 DATA = Path(__file__).resolve().parent.parent / "data"
@@ -39,10 +42,13 @@ FST_TEMPLATE = (
     / "Installed" / "Generators" / "AudioUnit" / "ZENOLOGY.fst"
 )
 
-# Layout of the ZENOLOGY wrapper payload (FL event 213) in the template state.
+# Layout of the ZENOLOGY wrapper payload (FL event 213), identical in every saved state
+# seen: the plist starts at byte 241, preceded by int64 sizes of the state chunk
+# (plist + 12) at 221 and of the plist itself at 233.
 PLIST_OFFSET = 241
-SIZE_FIELDS = (221, 233)  # int64 sizes of the state chunk and the plist inside it
 ADDR_PACK, ADDR_TONE = 0xFFFC008, 0xFFFC00C
+# Part settings the host can change (mono, legato, ?, portamento, portamento time).
+HOST_ADDRS = (0x75330, 0x75334, 0x75338, 0x7533C, 0x75340)
 # Tone arrows relative to the plugin window's top-left corner (points, BASIC page).
 ARROW_PREV = (100, 108)  # ▲ - previous tone number
 ARROW_NEXT = (100, 129)  # ▼ - next tone number
@@ -57,8 +63,13 @@ def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", s.lower()).replace("1", "l").replace("i", "l")
 
 
+@functools.lru_cache(maxsize=1)
+def _tones() -> tuple[dict, ...]:
+    return tuple(json.loads(TONES_FILE.read_text()))
+
+
 def find_tones(query: str, limit: int = 20) -> list[dict]:
-    tones = json.loads(TONES_FILE.read_text())
+    tones = [dict(t) for t in _tones()]
     q = _norm(query)
     exact = [t for t in tones if _norm(t["name"]) == q]
     if exact:
@@ -71,33 +82,57 @@ def find_tones(query: str, limit: int = 20) -> list[dict]:
 
 
 def _pack_size(pack: str) -> int:
-    return max(t["no"] for t in json.loads(TONES_FILE.read_text()) if t["pack"] == pack)
+    return max(t["no"] for t in _tones() if t["pack"] == pack)
 
 
-def _set_pairs(data: bytes, updates: dict[int, int]) -> bytes:
-    out = bytearray(data)
+def patch_state(payload: bytes, updates: dict[int, int], strict: bool = True) -> bytes:
+    """A ZENOLOGY plugin state (event 213) with some address/value pairs changed.
+
+    Refuses states whose layout differs from the known one rather than guessing.
+    With strict, every address in `updates` must exist in the state.
+    """
+    off = payload.find(b"bplist00")
+    if off != PLIST_OFFSET:
+        raise ZenologyError("unexpected ZENOLOGY state layout (plist offset)")
+    size = struct.unpack_from("<q", payload, off - 8)[0]
+    chunk = struct.unpack_from("<q", payload, off - 20)[0]
+    if chunk != size + 12 or off + size != len(payload):
+        raise ZenologyError("unexpected ZENOLOGY state layout (sizes)")
+    plist = plistlib.loads(payload[off:])
+    blob = bytearray(plist[ZEN_KEY])
     found = set()
-    for i in range(0, len(out) - 7, 8):
-        addr = struct.unpack(">I", out[i:i + 4])[0]
+    for i in range(0, len(blob) - 7, 8):
+        addr = struct.unpack_from(">I", blob, i)[0]
         if addr in updates:
-            out[i + 4:i + 8] = struct.pack(">I", updates[addr])
+            struct.pack_into(">I", blob, i + 4, updates[addr])
             found.add(addr)
-    if found != set(updates):
-        raise ZenologyError("ZENOLOGY state template is missing the tone reference fields")
-    return bytes(out)
+    if strict and found != set(updates):
+        raise ZenologyError(f"ZENOLOGY state lacks fields {sorted(set(updates) - found)}")
+    plist[ZEN_KEY] = bytes(blob)
+    new = plistlib.dumps(plist, fmt=plistlib.FMT_BINARY)
+    header = bytearray(payload[:off])
+    struct.pack_into("<q", header, off - 20, len(new) + 12)
+    struct.pack_into("<q", header, off - 8, len(new))
+    return bytes(header) + new
+
+
+def state_values(payload: bytes, addrs: Iterable[int]) -> dict[int, int]:
+    """Values of the given addresses in a ZENOLOGY state (missing ones left out)."""
+    plist = state_plist(payload)
+    blob = plist.get(ZEN_KEY) if plist else None
+    if not blob:
+        raise ZenologyError("not a ZENOLOGY plugin state")
+    wanted = set(addrs)
+    out = {}
+    for i in range(0, len(blob) - 7, 8):
+        addr = struct.unpack_from(">I", blob, i)[0]
+        if addr in wanted:
+            out[addr] = struct.unpack_from(">I", blob, i + 4)[0]
+    return out
 
 
 def build_fst(pack_id: int, tone_index: int, channel_name: str, out_path: Path) -> Path:
-    state = STATE_TEMPLATE.read_bytes()
-    plist = plistlib.loads(state[PLIST_OFFSET:])
-    key = "jp.co.roland.ZENOLOGY.data"
-    plist[key] = _set_pairs(plist[key], {ADDR_PACK: pack_id, ADDR_TONE: tone_index})
-    blob = plistlib.dumps(plist, fmt=plistlib.FMT_BINARY)
-    header = bytearray(state[:PLIST_OFFSET])
-    struct.pack_into("<Q", header, SIZE_FIELDS[0], len(blob) + 12)
-    struct.pack_into("<Q", header, SIZE_FIELDS[1], len(blob))
-    payload = bytes(header) + blob
-
+    payload = patch_state(STATE_TEMPLATE.read_bytes(), {ADDR_PACK: pack_id, ADDR_TONE: tone_index})
     fst_header, events = read_events(FST_TEMPLATE.read_bytes())
     patched = []
     for eid, val in events:
@@ -340,9 +375,9 @@ def read_tone_from_state(payload: bytes) -> dict:
 
 def describe_tone(info: dict) -> dict:
     """Add the pack folder, listed name and category from the tone index."""
-    tones = json.loads(TONES_FILE.read_text())
     hit = next(
-        (t for t in tones if t["pack_id"] == info["pack_id"] and t["no"] == info["number"]), None
+        (t for t in _tones() if t["pack_id"] == info["pack_id"] and t["no"] == info["number"]),
+        None,
     )
     out = dict(info)
     if hit:
@@ -363,6 +398,198 @@ def channel_tone(project: Path, channel: int) -> dict:
     if state is None:
         raise ZenologyError(f"channel {channel} has no plugin state")
     return describe_tone(read_tone_from_state(state))
+
+
+# ---------------------------------------------------------------- tone library (no screen)
+
+
+def library_dir() -> Path:
+    """One channel preset per tone; FL's browser shows it under Channel presets."""
+    return snapshot_dir() / "ZENOLOGY"
+
+
+def _safe(name: str) -> str:
+    return re.sub(r'[\\/:*?"<>|]', "_", name).strip() or "ZENOLOGY"
+
+
+def _preset_state(path: Path) -> bytes | None:
+    try:
+        _, events = read_events(path.read_bytes())
+    except (OSError, ValueError):
+        return None
+    return next((v for e, v in events if e == 213), None)
+
+
+def library_index() -> dict[tuple[int, int], Path]:
+    """(pack id, tone number) -> preset file, for every tone in the library."""
+    out: dict[tuple[int, int], Path] = {}
+    root = library_dir()
+    if not root.is_dir():
+        return out
+    for path in sorted(root.rglob("*.fst")):
+        state = _preset_state(path)
+        if not state:
+            continue
+        try:
+            info = read_tone_from_state(state)
+        except ZenologyError:
+            continue
+        out.setdefault((info["pack_id"], info["number"]), path)
+    return out
+
+
+def harvest_sources() -> list[Path]:
+    """Project files and channel presets that may hold ZENOLOGY tones."""
+    home = Path.home()
+    roots = [(user_data_dir(), 6), (home / "Downloads", 2), (home / "Desktop", 2)]
+    roots += [(Path(p), 4) for p in os.environ.get("FL_PROJECT_DIRS", "").split(os.pathsep) if p]
+    found: dict[Path, None] = {}
+    for root, depth in roots:
+        if not root.is_dir():
+            continue
+        for d in range(depth + 1):
+            for pattern in ("*.flp", "*.fst"):
+                for p in root.glob("/".join(["*"] * d + [pattern])):
+                    found.setdefault(p, None)
+    return list(found)
+
+
+def harvest(paths: Iterable[Path]) -> dict:
+    """Copy every ZENOLOGY tone found in these files into the library.
+
+    Only tones whose stored name matches the tone index for their pack and
+    number are taken (a freshly built .fst still holds the template's sound).
+    Library copies have the host's part settings (mono/legato/portamento) off.
+    """
+    from fl_studio_mcp.utils.fl_files import channel_bounds, preset_from_block
+
+    root = library_dir()
+    index = library_index()
+    added = []
+    for path in paths:
+        if root in path.parents:
+            continue
+        try:
+            _, events = read_events(path.read_bytes())
+        except (OSError, ValueError):
+            continue
+        version = next((v for e, v in events if e == 199), b"")
+        if path.suffix.lower() == ".flp":
+            blocks = [events[s + 1:e] for s, e in channel_bounds(events)]
+        else:
+            blocks = [events]
+        for block in blocks:
+            state = next((v for e, v in block if e == 213), None)
+            if not state or b"bplist00" not in state:
+                continue
+            try:
+                info = describe_tone(read_tone_from_state(state))
+                key = (info["pack_id"], info["number"])
+                if not info.get("consistent") or key in index:
+                    continue
+                clean = patch_state(state, dict.fromkeys(HOST_ADDRS, 0), strict=False)
+            except ZenologyError:
+                continue
+            name = info["listed_name"]
+            out = root / info["pack"] / f"{_safe(name)}.fst"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(preset_from_block(version, block, name, clean))
+            index[key] = out
+            added.append({"pack": info["pack"], "number": info["number"], "name": name,
+                          "from": path.name})
+    return {"added": added, "library": len(index)}
+
+
+def library_tone(tone: dict, rescan: bool = True) -> Path | None:
+    """The library preset of `tone`; rescans the user's files once when it's missing."""
+    key = (tone["pack_id"], tone["no"])
+    path = library_index().get(key)
+    if path is None and rescan:
+        harvest(harvest_sources())
+        path = library_index().get(key)
+    return path
+
+
+def load_from_library(tone: dict, send_command, read_state: Callable | None = None) -> dict:
+    """Add `tone` as a new channel from its library preset (no screen, mouse or keyboard)."""
+    path = library_tone(tone)
+    if path is None:
+        raise ZenologyError(f"{tone['name']} is not in the tone library")
+    existing = [c["name"] for c in send_command("channels.getAll").get("channels", [])]
+    name = unique_channel_name(_safe(tone["name"])[:24], existing)
+    src = path
+    if name != path.stem:  # FL names the channel after the file
+        header, events = read_events(path.read_bytes())
+        events = [(e, (name + "\0").encode("utf-16-le") if e == 203 else v) for e, v in events]
+        src = CACHE / "library-load" / f"{name}.fst"
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_bytes(write_events(header, events))
+    channel = _open_fst(src, send_command)
+    send_command("channels.closeEditor", {"index": channel})
+    result = {"channel": channel, "channel_name": name, "tone": tone["name"],
+              "pack": tone["pack"], "source": "library", "clicks": 0,
+              "verified": False, "verified_by": None}
+    if read_state is not None:
+        try:
+            loaded = read_state(channel)
+        except Exception:  # noqa: BLE001 - the preset itself was verified when harvested
+            loaded = None
+        if loaded is not None:
+            result["loaded"] = {k: loaded.get(k) for k in ("pack_id", "number", "name")}
+            result["verified_by"] = "state"
+            result["verified"] = (loaded.get("pack_id"), loaded.get("number")) == (
+                tone["pack_id"], tone["no"])
+    return result
+
+
+def set_channel_tone(project: Path, channel: int, tone: dict, rename: str | None = None,
+                     keep_part: bool = True) -> dict:
+    """Swap the tone of an existing ZENOLOGY channel in a saved project (file edit).
+
+    The channel keeps its index, notes, routing and effects; its part settings
+    (mono/legato/portamento) are kept unless keep_part is False. Writes a backup.
+    """
+    from fl_studio_mcp.utils.backups import atomic_write, make_backup
+    from fl_studio_mcp.utils.fl_files import channel_bounds
+
+    path = library_tone(tone)
+    if path is None:
+        raise ZenologyError(f"{tone['name']} is not in the tone library")
+    new_state = _preset_state(path)
+    header, events = read_events(project.read_bytes())
+    bounds = channel_bounds(events)
+    if not 0 <= channel < len(bounds):
+        raise ZenologyError(f"channel {channel} does not exist")
+    start, end = bounds[channel]
+    idx = next((i for i in range(start, end) if events[i][0] == 213), None)
+    if idx is None or not new_state:
+        raise ZenologyError(f"channel {channel} has no plugin state")
+    old_state = events[idx][1]
+    before = describe_tone(read_tone_from_state(old_state))  # refuses non-ZENOLOGY channels
+    if keep_part:
+        new_state = patch_state(new_state, state_values(old_state, HOST_ADDRS), strict=False)
+    events[idx] = (213, new_state)
+    renamed = False
+    if rename:
+        name_at = next((i for i in range(start, end) if events[i][0] == 203), None)
+        if name_at is not None:
+            events[name_at] = (203, (rename + "\0").encode("utf-16-le"))
+            renamed = True
+    data = write_events(header, events)
+    _, check = read_events(data)
+    cb = channel_bounds(check)
+    got = read_tone_from_state(next(v for e, v in check[cb[channel][0]:cb[channel][1]] if e == 213))
+    if len(cb) != len(bounds) or (got["pack_id"], got["number"]) != (tone["pack_id"], tone["no"]):
+        raise ZenologyError("verification failed; project left untouched")
+    backup = make_backup(project, "tone")
+    atomic_write(project, data)
+    return {
+        "channel": channel,
+        "from": {k: before.get(k) for k in ("pack", "number", "name")},
+        "to": {"pack": tone["pack"], "number": tone["no"], "name": tone["name"]},
+        "renamed": rename if renamed else None,
+        "backup": str(backup),
+    }
 
 
 # ---------------------------------------------------------------- loading tones on screen
