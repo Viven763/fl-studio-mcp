@@ -276,3 +276,35 @@ def add_sampler_channels(project: Path, samplers: list[tuple[str, str]]) -> dict
     backup = make_backup(project, "sampler")
     atomic_write(project, data)
     return {"channels": after, "backup": str(backup)}
+
+
+def set_channel_sample(project: Path, channel: int, path: str, name: str | None = None) -> dict:
+    """Point Sampler channel `channel` at another audio file (and optionally rename it)."""
+    audio = Path(path).expanduser()
+    if not audio.exists():
+        raise ValueError(f"audio file not found: {path}")
+    header, events = read_events(project.read_bytes())
+    blocks = _blocks(events)
+    if not 0 <= channel < len(blocks):
+        raise ValueError(f"channel {channel} does not exist")
+    start, end = blocks[channel]
+    hit = next((i for i in range(start, end) if events[i][0] == EV_SAMPLE_PATH), None)
+    if hit is None:
+        raise ValueError(f"channel {channel} is not a Sampler channel")
+    old = events[hit][1].decode("utf-16-le", "replace").rstrip("\x00")
+    events[hit] = (EV_SAMPLE_PATH, (str(audio) + "\0").encode("utf-16-le"))
+    if name:
+        at = next((i for i in range(start, end) if events[i][0] == EV_CH_NAME), None)
+        if at is None:
+            raise ValueError(f"channel {channel} has no name to change")
+        events[at] = (EV_CH_NAME, (name + "\0").encode("utf-16-le"))
+    data = write_events(header, events)
+    _, check = read_events(data)
+    cb = _blocks(check)
+    got = next(v for e, v in check[cb[channel][0]:cb[channel][1]] if e == EV_SAMPLE_PATH)
+    if len(cb) != len(blocks) or got.decode("utf-16-le").rstrip("\x00") != str(audio):
+        raise ValueError("verification failed; project left untouched")
+    backup = make_backup(project, "sampler")
+    atomic_write(project, data)
+    return {"channel": channel, "sample": str(audio), "previous": old,
+            "channels": channel_names(check), "backup": str(backup)}

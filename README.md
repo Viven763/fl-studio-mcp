@@ -368,6 +368,9 @@ fl-studio-mcp
 | `fl_tidy_backups` | Move older backups (next to a project or in `Backup/`) into `<project name> backups/` (dry run first) |
 | `fl_new_project` | New project file from FL's template |
 | `fl_delete_channels` | Delete channels by name or global index |
+| `fl_find_samples` | Search audio samples (FL packs, FL downloads, `FL_SAMPLE_DIRS`) |
+| `fl_add_sample_channels` | Add Sampler channels playing audio files |
+| `fl_set_channel_sample` | Load another audio file into a Sampler channel |
 | `fl_show_plugin_editor` / `fl_close_plugin_windows` | Show/hide plugin windows |
 
 **Notes and patterns** (file based: any pattern and channel, no piano roll)
