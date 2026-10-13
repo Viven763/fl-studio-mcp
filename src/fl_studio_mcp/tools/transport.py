@@ -8,6 +8,26 @@ if TYPE_CHECKING:
     from fastmcp import FastMCP
 
 
+SONG_POS_UNITS = ("seconds", "ms", "bars", "ticks", "fraction")
+# Runs inside FL. setSongPos modes: -1 fraction, 0 ms, 1 s, 2 absolute ticks.
+SET_SONG_POS = """
+u, p, m = ARGS["unit"], ARGS["pos"], ARGS["mode"]
+if m is not None:
+    transport.setSongPos(float(p) if m == -1 else int(round(p)), m)
+elif u == "fraction":
+    transport.setSongPos(float(p), -1)
+elif u == "ms":
+    transport.setSongPos(int(round(p)), 0)
+elif u == "seconds":
+    transport.setSongPos(int(round(p * 1000)), 0)
+elif u == "ticks":
+    transport.setSongPos(int(round(p)), 2)
+else:
+    transport.setSongPos(int(round((p - 1) * 4 * general.getRecPPQ())), 2)
+result = transport.getSongPosHint()
+"""
+
+
 def register_transport_tools(mcp: FastMCP) -> None:
     """Register transport control tools with the MCP server."""
     from fl_studio_mcp.utils.connection import get_connection
@@ -78,47 +98,48 @@ def register_transport_tools(mcp: FastMCP) -> None:
         }
 
     @mcp.tool()
-    def fl_set_song_position(position: float, mode: int = 2) -> str:
-        """Set the playback position in FL Studio.
+    def fl_set_song_position(
+        position: float, unit: str = "seconds", mode: int | None = None
+    ) -> str:
+        """Set the playback position (song position in song mode, else pattern position).
 
         Args:
-            position: The position value. Interpretation depends on mode.
-            mode: Position format:
-                  0 = Percentage (0.0 to 1.0)
-                  1 = Time in milliseconds
-                  2 = Time in seconds (default)
-                  3 = Position in ticks
-                  4 = Position as bars:steps:ticks (encoded)
+            position: Where to go, in `unit`
+            unit: "seconds" (default), "ms", "bars" (1-based, 4/4: bar 9 = start of bar 9),
+                  "ticks" (absolute) or "fraction" (0..1 of the song)
+            mode: Raw FL mode instead of `unit`: -1 fraction, 0 ms, 1 s, 2 absolute ticks
+        Returns the new position as FL shows it (bars:steps:ticks).
         """
-        conn = get_connection()
-        result = conn.send_command("transport.setPosition", {
-            "position": position,
-            "mode": mode,
-        })
+        from fl_studio_mcp.utils.fl_exec import exec_in_fl
 
-        if not result.get("success", False) and "error" in result:
-            return f"Error: {result['error']}"
-
-        new_pos = result.get("position", "")
-        return f"Position set to {new_pos}"
+        if mode is None and unit not in SONG_POS_UNITS:
+            return f"Error: unit must be one of {', '.join(SONG_POS_UNITS)}"
+        if mode is not None and mode not in (-1, 0, 1, 2):
+            return "Error: mode must be -1, 0, 1 or 2"
+        try:
+            hint = exec_in_fl(
+                SET_SONG_POS, args={"unit": unit, "pos": position, "mode": mode}
+            )
+        except (RuntimeError, ValueError) as e:
+            return f"Error: {e}"
+        return f"Position set to {hint}"
 
     @mcp.tool()
     def fl_get_song_length() -> dict:
-        """Get the total length of the current song/pattern.
+        """Get the length of the whole song (playlist), whatever the loop mode.
 
-        Returns the length in multiple formats for convenience.
+        Returns bars, absolute ticks, seconds, milliseconds and the project PPQ.
         """
-        conn = get_connection()
-        result = conn.send_command("transport.getLength")
+        from fl_studio_mcp.utils.fl_exec import exec_in_fl
 
-        if not result.get("success", False) and "error" in result:
-            return {"error": result["error"]}
-
-        return {
-            "ticks": result.get("ticks", 0),
-            "seconds": result.get("seconds", 0),
-            "milliseconds": result.get("milliseconds", 0),
-        }
+        try:
+            return exec_in_fl(
+                "result = {'bars': transport.getSongLength(3), "
+                "'ticks': transport.getSongLength(2), 'seconds': transport.getSongLength(1), "
+                "'milliseconds': transport.getSongLength(0), 'ppq': general.getRecPPQ()}"
+            )
+        except (RuntimeError, ValueError) as e:
+            return {"error": str(e)}
 
     @mcp.tool()
     def fl_set_loop_mode(mode: str) -> str:

@@ -30,6 +30,9 @@ def register_mixer_tools(mcp: FastMCP) -> None:
     def fl_get_mixer_track_info(track: int) -> dict:
         """Get detailed information about a specific mixer track.
 
+        stereo_separation: negative = wider (-1 = 100% separated), positive =
+        narrower towards mono (+1 = 100% merged), 0 = untouched.
+
         Args:
             track: Mixer track index (0 = Master, 1-124 = insert tracks)
         """
@@ -236,23 +239,27 @@ def register_mixer_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def fl_set_stereo_separation(track: int, separation: float) -> str:
-        """Set the stereo separation of a mixer track.
+        """Set the stereo separation (width) of a mixer track; the value is read back.
+
+        Sign (FL's API docs have it backwards): NEGATIVE widens the track
+        (-1.0 = 100% separated), POSITIVE narrows it towards mono (+1.0 = 100%
+        merged), 0.0 = untouched. A mono source can't be widened this way.
 
         Args:
             track: Mixer track index
-            separation: Stereo separation from -1.0 (merged/mono) to 1.0 (full separation).
-                       0.0 is default.
+            separation: -1.0 (widest) .. 0.0 (default) .. 1.0 (mono)
         """
+        from fl_studio_mcp.utils.fl_exec import exec_in_fl
+
         if not -1.0 <= separation <= 1.0:
             return "Error: Separation must be between -1.0 and 1.0"
-
-        conn = get_connection()
-        result = conn.send_command("mixer.setStereoSep", {
-            "track": track,
-            "separation": separation,
-        })
-
-        if not result.get("success", False) and "error" in result:
-            return f"Error: {result['error']}"
-
-        return f"Track {track} stereo separation set to {separation}"
+        try:
+            now = float(exec_in_fl(
+                "mixer.setTrackStereoSep(ARGS['t'], ARGS['s'])\n"
+                "result = mixer.getTrackStereoSep(ARGS['t'])",
+                args={"t": track, "s": separation},
+            ))
+        except (RuntimeError, ValueError, TypeError) as e:
+            return f"Error: {e}"
+        feel = "wider" if now < -0.005 else "narrower (towards mono)" if now > 0.005 else "default"
+        return f"Track {track} stereo separation is now {now:+.2f} ({feel})"
