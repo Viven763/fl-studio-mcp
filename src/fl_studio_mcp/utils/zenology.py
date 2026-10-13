@@ -131,7 +131,18 @@ def _helper() -> Path:
 
 
 def _osa(script: str) -> str:
-    proc = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=15)
+    """Run AppleScript; failures (e.g. missing Accessibility/Automation permission) raise."""
+    try:
+        proc = subprocess.run(
+            ["osascript", "-e", script], capture_output=True, text=True, timeout=15
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        raise ZenologyError(f"osascript failed: {e}") from e
+    if proc.returncode != 0:
+        raise ZenologyError(
+            "osascript failed (Accessibility/Automation permission for the app running "
+            f"this server?): {proc.stderr.strip() or proc.returncode}"
+        )
     return proc.stdout.strip()
 
 
@@ -147,25 +158,49 @@ def title_matches(window_title: str, channel_name: str) -> bool:
     return window_title == channel_name or window_title.startswith(channel_name + " (")
 
 
-def _window_rect(channel_name: str) -> tuple[int, int, int, int] | None:
+def pick_window(windows: list[tuple[str, tuple]], channel_name: str) -> tuple | None:
+    """The rect of `channel_name`'s plugin window among (title, rect) pairs.
+
+    Exact titles ("Name" / "Name (Insert)") win; otherwise a title that continues
+    after the name with a separator ("Name - ZENOLOGY") - but never one where the
+    name continues as a longer word ("Upright" must not pick "Upright Bass").
+    """
+    exact = [rect for title, rect in windows if title_matches(title, channel_name)]
+    if exact:
+        return exact[0]
+    loose = [
+        rect for title, rect in windows
+        if title.startswith(channel_name)
+        and re.match(r"\s*([(\[\-–—|:]|$)", title[len(channel_name):])
+    ]
+    return loose[0] if len(loose) == 1 else None
+
+
+def _windows() -> list[tuple[str, tuple[int, int, int, int]]]:
+    """(title, (x, y, w, h)) of FL's windows on the visible Space."""
     out = _osa(
         'tell application "System Events" to tell process "OsxFL"\n'
         "set r to {}\n"
         "repeat with w in windows\n"
+        "try\n"  # one odd window (no position/size) must not hide all the others
         "set end of r to (name of w) & \"|\" & (item 1 of (position of w as list)) & \",\" & "
         "(item 2 of (position of w as list)) & \",\" & (item 1 of (size of w as list)) & \",\" & "
         "(item 2 of (size of w as list))\n"
+        "end try\n"
         "end repeat\n"
         "set AppleScript's text item delimiters to \"\\n\"\n"
         "return r as text\n"
         "end tell"
     )
+    found = []
     for line in out.splitlines():
-        name, _, rect = line.partition("|")
-        if title_matches(name, channel_name) and rect:
+        title, _, rect = line.partition("|")
+        try:
             x, y, w, h = (int(float(v)) for v in rect.split(","))
-            return x, y, w, h
-    return None
+        except ValueError:
+            continue
+        found.append((title, (x, y, w, h)))
+    return found
 
 
 def read_tone_label(rect: tuple[int, int, int, int]) -> str:
@@ -273,11 +308,18 @@ def _click_arrow(rect: tuple[int, int, int, int], direction: str) -> None:
     _run([str(_helper()), "click", str(rect[0] + dx), str(rect[1] + dy)])
 
 
-def _observe_screen(rect: tuple[int, int, int, int], title: str) -> tuple[int | None, str]:
+def _observe_screen(rect: tuple[int, int, int, int], title: str) -> tuple[list[int], str]:
+    """Tone numbers ("067:") readable in the plugin window, and the window's text."""
     lines = [ln for ln in read_tone_label(rect).splitlines() if not ln.startswith(title)]
     text = "\n".join(lines)
-    numbers = _numbers(text)
-    return (numbers[0] if numbers else None), text
+    return _numbers(text), text
+
+
+def shown_number(numbers: list[int], target: int) -> int | None:
+    """Which OCR'd number is the tone number: the target if visible, else the closest."""
+    if not numbers:
+        return None
+    return target if target in numbers else min(numbers, key=lambda n: abs(n - target))
 
 
 def load_tone(tone: dict, send_command, read_state: Callable | None = None) -> dict:
@@ -325,9 +367,11 @@ def _open_fst(fst: Path, send_command) -> int:
     return after - 1
 
 
-def _find_window(name: str, channel: int, send_command) -> tuple[int, int, int, int] | None:
+def _find_window(name: str, channel: int, send_command) -> tuple[int, int, int, int]:
+    seen: list[tuple[str, tuple]] = []
     for attempt in range(24):  # macOS only lists windows of the visible Space; give FL a moment
-        rect = _window_rect(name)
+        seen = _windows()
+        rect = pick_window(seen, name)
         if rect:
             return rect
         if attempt in (8, 16):  # FL sometimes loads the plugin without showing its window
@@ -336,7 +380,10 @@ def _find_window(name: str, channel: int, send_command) -> tuple[int, int, int, 
                 send_command("debug.exec", {"code": code})
                 time.sleep(0.5)
         time.sleep(0.5)
-    return None
+    titles = [t for t, _r in seen][:12]
+    raise ZenologyError(
+        f"ZENOLOGY window for channel {channel} ({name!r}) not found; FL windows seen: {titles}"
+    )
 
 
 def _select_on_screen(
@@ -374,11 +421,14 @@ def _select_on_screen(
         while True:
             time.sleep(settle)
             try:
-                shown, label = observe(rect, f"{name} (")
+                numbers, label = observe(rect, f"{name} (")
+                shown = shown_number(numbers, target)
             except ZenologyError:
                 shown = None  # can't read the screen: rely on the saved state below
             if shown is None or shown == target or clicks >= max_clicks:
                 break
+            if abs(shown - target) > max_clicks - clicks:
+                break  # too far off to be a near miss: don't click around blindly
             direction, _n = plan_clicks(shown, target)
             click(rect, direction)  # one step at a time, then look again
             clicks += 1

@@ -18,12 +18,12 @@ def register_production_tools(mcp: FastMCP) -> None:
     from fl_studio_mcp.utils.fl_exec import exec_in_fl
     from fl_studio_mcp.utils.fl_files import EDIT_LOCK, reopen_and_wait, save_project_and_locate
 
-    def _exec(code: str, timeout: float = 10.0) -> Any:
-        return exec_in_fl(code, timeout=timeout)
+    def _exec(code: str, timeout: float = 10.0, args: dict | None = None) -> Any:
+        return exec_in_fl(code, timeout=timeout, args=args)
 
     def _channel_names() -> list[str]:
         return _exec(
-            "result = [channels.getChannelName(i) for i in range(channels.channelCount())]"
+            "result = [channels.getChannelName(i, True) for i in range(channels.channelCount(1))]"
         )
 
     @mcp.tool()
@@ -61,11 +61,15 @@ def register_production_tools(mcp: FastMCP) -> None:
             clips: [{"pattern": 2, "start_bar": 1, "bars": 4, "track": 1}, ...]
                    start_bar is 1-based; track is the playlist track (1-based).
         """
+        conn = get_connection()
+        with EDIT_LOCK:
+            return _arrange(conn, clips)
+
+    def _arrange(conn, clips: list[dict]) -> dict:
         from fl_studio_mcp.utils.flp_events import read_events
         from fl_studio_mcp.utils.flp_notes import _ppq
         from fl_studio_mcp.utils.flp_playlist import write_arrangement
 
-        conn = get_connection()
         try:
             names = _channel_names()
             project = save_project_and_locate(conn.send_command)
@@ -81,10 +85,10 @@ def register_production_tools(mcp: FastMCP) -> None:
                 for c in clips
             ]
             res = write_arrangement(project, plan)
-            reopen_and_wait(conn.send_command, project, expected=names)
+            reloaded = reopen_and_wait(conn.send_command, project, expected=names)
         except (RuntimeError, ValueError, KeyError) as e:
             return {"error": str(e)}
-        return {"clips": res["clips"], "backup": res["backup"]}
+        return {"clips": res["clips"], "backup": res["backup"], "reloaded": reloaded}
 
     @mcp.tool()
     def fl_add_effects(effects: list[dict]) -> dict:
@@ -100,9 +104,13 @@ def register_production_tools(mcp: FastMCP) -> None:
         Args:
             effects: [{"insert": 4, "slot": 0, "plugin": "Fruity Soft Clipper"}, ...]
         """
+        conn = get_connection()
+        with EDIT_LOCK:
+            return _add_effects(conn, effects)
+
+    def _add_effects(conn, effects: list[dict]) -> dict:
         from fl_studio_mcp.utils.flp_mixer import add_effects, list_slots
 
-        conn = get_connection()
         try:
             names = _channel_names()
             project = save_project_and_locate(conn.send_command)
@@ -112,10 +120,10 @@ def register_production_tools(mcp: FastMCP) -> None:
             if busy:
                 return {"error": f"slots not empty: {busy}", "current": have}
             res = add_effects(project, todo)
-            reopen_and_wait(conn.send_command, project, expected=names)
+            reloaded = reopen_and_wait(conn.send_command, project, expected=names)
         except (RuntimeError, ValueError, KeyError) as e:
             return {"error": str(e)}
-        return {"added": res["added"], "backup": res["backup"]}
+        return {"added": res["added"], "backup": res["backup"], "reloaded": reloaded}
 
     @mcp.tool()
     def fl_get_effect_params(

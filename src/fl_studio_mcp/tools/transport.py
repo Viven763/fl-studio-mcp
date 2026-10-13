@@ -9,22 +9,29 @@ if TYPE_CHECKING:
 
 
 SONG_POS_UNITS = ("seconds", "ms", "bars", "ticks", "fraction")
-# Runs inside FL. setSongPos modes: -1 fraction, 0 ms, 1 s, 2 absolute ticks.
+# Runs inside FL. Everything is converted to absolute ticks (setSongPos mode 2). The
+# position FL reports (getSongPosHint) only updates after the script returns, so the
+# new position is formatted here as bar:step:tick (4/4, steps = 16ths).
 SET_SONG_POS = """
 u, p, m = ARGS["unit"], ARGS["pos"], ARGS["mode"]
 if m is not None:
-    transport.setSongPos(float(p) if m == -1 else int(round(p)), m)
-elif u == "fraction":
-    transport.setSongPos(float(p), -1)
+    u = {-1: "fraction", 0: "ms", 1: "seconds", 2: "ticks"}[m]
+ppq = general.getRecPPQ()
+bpm = mixer.getCurrentTempo() / 1000
+if u == "fraction":
+    t = p * transport.getSongLength(2)
 elif u == "ms":
-    transport.setSongPos(int(round(p)), 0)
+    t = p / 1000 * bpm / 60 * ppq
 elif u == "seconds":
-    transport.setSongPos(int(round(p * 1000)), 0)
+    t = p * bpm / 60 * ppq
 elif u == "ticks":
-    transport.setSongPos(int(round(p)), 2)
+    t = p
 else:
-    transport.setSongPos(int(round((p - 1) * 4 * general.getRecPPQ())), 2)
-result = transport.getSongPosHint()
+    t = (p - 1) * 4 * ppq
+t = max(0, int(round(t)))
+transport.setSongPos(t, 2)
+bar_t, step_t = 4 * ppq, max(1, ppq // 4)
+result = "%d:%02d:%02d" % (t // bar_t + 1, (t % bar_t) // step_t + 1, t % step_t)
 """
 
 
@@ -108,7 +115,7 @@ def register_transport_tools(mcp: FastMCP) -> None:
             unit: "seconds" (default), "ms", "bars" (1-based, 4/4: bar 9 = start of bar 9),
                   "ticks" (absolute) or "fraction" (0..1 of the song)
             mode: Raw FL mode instead of `unit`: -1 fraction, 0 ms, 1 s, 2 absolute ticks
-        Returns the new position as FL shows it (bars:steps:ticks).
+        Returns the new position as bar:step:tick (4/4; step = 16th note).
         """
         from fl_studio_mcp.utils.fl_exec import exec_in_fl
 

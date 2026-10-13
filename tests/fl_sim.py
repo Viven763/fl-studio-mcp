@@ -59,7 +59,7 @@ class Plugins:
         self.sets += 1
         self._p(i, s)[1][p].value = max(0.0, min(1.0, v))
 
-    def getParamValueString(self, p, i, s=-1, pickup=0, g=False):  # noqa: N802
+    def getParamValueString(self, p, i, s=-1, g=False):  # noqa: N802 - FL 2026: 4 args max
         return self._p(i, s)[1][p].text()
 
 

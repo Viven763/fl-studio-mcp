@@ -6,10 +6,13 @@ from fl_studio_mcp.utils import zenology
 from fl_studio_mcp.utils.zenology import (
     STATE_TEMPLATE,
     ZenologyError,
+    _numbers,
     _select_on_screen,
     describe_tone,
+    pick_window,
     plan_clicks,
     read_tone_from_state,
+    shown_number,
     title_matches,
     unique_channel_name,
 )
@@ -61,7 +64,8 @@ class Screen:
 
     def observe(self, rect, title):
         names = {8: "Light Padding", 9: "Upright", 10: "Ambient Noise"}
-        return self.number, f"{self.number:02d}:\n{names.get(self.number, '?')}"
+        text = f"EQ 1:\n{self.number:02d}:\n{names.get(self.number, '?')}"
+        return [1, self.number], text
 
 
 @pytest.fixture
@@ -94,7 +98,7 @@ def test_window_closed_on_error(fake_send, quick):
 
     with pytest.raises(ZenologyError):
         _select_on_screen(TONE, 3, "Upright", True, send, click=boom,
-                          observe=lambda r, t: (None, ""), find_window=lambda: (0, 0, 1, 1))
+                          observe=lambda r, t: ([], ""), find_window=lambda: (0, 0, 1, 1))
     assert ("channels.closeEditor", {"index": 3}) in send.calls
 
 
@@ -120,3 +124,30 @@ def test_names_are_16_chars_at_stride_4():
     payload = b"\x00" * 8 + struct.pack("<q", len(plist)) + plist
     assert read_tone_from_state(payload) == {"pack_id": 1007, "index": 73, "number": 74,
                                              "name": "Marcato Vc"}
+
+
+def test_pick_window_exact_loose_and_never_longer_names():
+    wins = [("Upright Bass (Master)", (1, 1, 1, 1)), ("Upright - ZENOLOGY", (2, 2, 2, 2))]
+    assert pick_window(wins, "Upright") == (2, 2, 2, 2)
+    assert pick_window(wins + [("Upright (Insert 3)", (3, 3, 3, 3))], "Upright") == (3, 3, 3, 3)
+    assert pick_window([("Upright Bass (Master)", (1, 1, 1, 1))], "Upright") is None
+    assert pick_window([("Sad S.VlnSRX 2", (4, 4, 4, 4))], "Sad S.VlnSRX") is None
+
+
+def test_numbers_and_shown_number():
+    text = "v 067:\nSad S.VlnSRX\nEQ 1:\nPart 12: x"
+    assert _numbers(text) == [67, 1]
+    assert shown_number([1, 67], 67) == 67
+    assert shown_number([1, 66], 67) == 66
+    assert shown_number([], 67) is None
+
+
+def test_far_off_reading_stops_clicking(fake_send, quick):
+    clicks = []
+    res = _select_on_screen(
+        TONE, 5, "Upright", True, fake_send(lambda a, p: {"success": True}),
+        read_state=lambda ch: {"pack_id": 5027, "number": 9, "name": "Upright"},
+        click=lambda r, d: clicks.append(d), observe=lambda r, t: ([40], "40:"),
+        find_window=lambda: (0, 0, 1, 1),
+    )
+    assert clicks == ["prev"] and res["verified"] and res["verified_by"] == "state"

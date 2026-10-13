@@ -71,6 +71,9 @@ class MIDIConnection:
         self._replies: dict[int, dict[str, Any]] = {}
         self._cond = threading.Condition()
         self._lock = threading.Lock()
+        # One command in flight at a time: FL handles them one by one anyway, and a
+        # command arriving while FL is saving the project can stall FL for minutes.
+        self._command_lock = threading.Lock()
 
         # File paths for JSON communication
         self._hardware_dir = _get_fl_hardware_dir()
@@ -271,6 +274,10 @@ class MIDIConnection:
             "params": params or {},
         }
 
+        with self._command_lock:
+            return self._send_locked(command, timeout)
+
+    def _send_locked(self, command: dict[str, Any], timeout: float) -> dict[str, Any]:
         self._choose_transport()
         if self._transport == "sysex":
             reply = self._send_sysex(command, timeout)

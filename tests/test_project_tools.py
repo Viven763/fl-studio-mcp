@@ -1,3 +1,4 @@
+import time
 from pathlib import Path
 
 import pytest
@@ -75,6 +76,7 @@ def test_save_as_copies_opens_verifies(box):
     assert res == {"project": str(target), "previous": str(src), "reloaded": True,
                    "verified": True}
     assert target.read_bytes() == b"song"
+    assert target.stat().st_mtime < time.time() - 60  # not "new" until FL saves into it
 
 
 def test_save_as_no_overwrite(box):
@@ -110,7 +112,8 @@ def test_tidy_dry_run_then_move(box, tmp_path, monkeypatch):
         (folder / name).write_bytes(b"x")
     monkeypatch.setattr(fl_files, "_last_project", folder / "Song.before-notes-20261011-224511.flp")
     dry = box.tools["fl_tidy_backups"](str(folder))
-    assert len(dry["moves"]) == 1 and dry["skipped"] and dry["dry_run"]
+    assert dry["files"] == ["Song.before-fx-20261011-195006.flp"]
+    assert dry["skipped"] and dry["dry_run"]
     assert (folder / "Song.before-fx-20261011-195006.flp").exists()
     done = box.tools["fl_tidy_backups"](str(folder), dry_run=False)
     assert (folder / "Backup" / "Song.before-fx-20261011-195006.flp").exists()

@@ -20,6 +20,8 @@ def test_build_routing_view_filters_defaults():
     violin = next(i for i in view["inserts"] if i["track"] == 8)
     assert {"to": 10, "to_name": "Reverb", "level": 0.35} in violin["routes"]
     assert violin["channels"] == ["Violin"]
+    master = next(i for i in view["inserts"] if i["track"] == 0)
+    assert {x["from"] for x in master["inputs"]} == {4, 5, 7, 8, 10}  # not every unused insert
     reverb = next(i for i in view["inserts"] if i["track"] == 10)
     assert reverb["inputs"] == [{"from": 8, "from_name": "Violin", "level": 0.35}]
     assert view["channels"][2] == {"channel": 2, "name": "Violin", "insert": 8}

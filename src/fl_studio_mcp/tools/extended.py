@@ -252,9 +252,11 @@ def register_extended_tools(mcp: FastMCP) -> None:
                                      args={"c": channel})
             except (RuntimeError, ValueError, ZenologyError) as e:
                 return {"error": str(e)}
+        ch = re.sub(r"\W", "", ch_name).lower()
         names = {re.sub(r"\W", "", str(info.get(k, ""))).lower() for k in ("name", "listed_name")}
+        matches = any(n and ch and (n in ch or ch in n) for n in names)
         return {"channel": channel, "channel_name": ch_name, **info,
-                "matches_channel_name": re.sub(r"\W", "", ch_name).lower() in names}
+                "matches_channel_name": matches}
 
     @mcp.tool()
     def fl_zenology_load(name: str, pack: str | None = None) -> dict:

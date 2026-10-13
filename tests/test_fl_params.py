@@ -98,5 +98,18 @@ def test_missing_plugin():
         param_names(5, 1, exec_fn=FLSim())
 
 
+def test_value_string_with_documented_signature():
+    """Older/documented API: (param, index, slot, pickupMode, useGlobalIndex), no defaults."""
+    sim = eq_sim()
+
+    class DocumentedPlugins(type(sim.plugins)):
+        def getParamValueString(self, p, i, s, pickup, g):  # noqa: N802
+            return self._p(i, s)[1][p].text()
+
+    sim.plugins.__class__ = DocumentedPlugins
+    res = set_params(8, 0, [{"param": 2, "text": "Low pass"}], exec_fn=sim)
+    assert res["params"]["2"]["text"] == "Low pass"
+
+
 def test_lib_compiles():
     compile(FL_PARAM_LIB, "<fl>", "exec")

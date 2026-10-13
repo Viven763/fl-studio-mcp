@@ -29,7 +29,10 @@ def _gv(p, i, s):
 def _sv(p, i, s, v):
     plugins.setParamValue(v, p, i, s, midi.PIM_None, True)
 def _pv(p, i, s):
-    return plugins.getParamValueString(p, i, s, midi.PIM_None, True)
+    try:  # FL 2025/2026: (param, index, slot, useGlobalIndex)
+        return plugins.getParamValueString(p, i, s, True)
+    except TypeError:  # API docs: (param, index, slot, pickupMode, useGlobalIndex)
+        return plugins.getParamValueString(p, i, s, midi.PIM_None, True)
 def _num(t):
     m = _re.search(r"-?\d+(?:[.,]\d+)?", t or "")
     if not m:

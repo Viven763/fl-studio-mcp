@@ -109,7 +109,7 @@ def build_routing_view(raw: dict, track: int | None = None) -> dict:
             "routes": [{"to": d, "to_name": names[d], "level": lvl} for s, d, lvl in routes
                        if s == t],
             "inputs": [{"from": s, "from_name": names[s], "level": lvl} for s, d, lvl in routes
-                       if d == t],
+                       if d == t and (track is not None or s in keep)],
         })
     view = {
         "inserts": inserts,

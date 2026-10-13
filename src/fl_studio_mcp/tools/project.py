@@ -7,6 +7,7 @@ until FL has really loaded them.
 
 from __future__ import annotations
 
+import os
 import shutil
 import time
 from pathlib import Path
@@ -106,6 +107,8 @@ def register_project_tools(mcp: FastMCP) -> None:
                     make_backup(target, "overwrite")
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, target)
+                old = time.time() - 120  # so only a real save by FL makes it the newest file
+                os.utime(target, (old, old))
                 names = _live_names()
                 reloaded = reopen_and_wait(send, target, expected=names)
                 remember_project(target)  # only found again if FL really saves into it
@@ -195,7 +198,7 @@ def register_project_tools(mcp: FastMCP) -> None:
         Args:
             folder: Project folder (default: the open project's folder)
             dry_run: Only list what would be moved
-        Returns {"folder", "moves": [[from, to]], "skipped", "dry_run"}.
+        Returns {"folder", "backup_folder", "files": [names], "skipped", "dry_run"}.
         """
         try:
             if folder:
@@ -219,12 +222,14 @@ def register_project_tools(mcp: FastMCP) -> None:
             while dest.exists():
                 dest = where / "Backup" / f"{p.stem}-{n}.flp"
                 n += 1
-            moves.append([str(p), str(dest)])
+            moves.append((p, dest))
         if not dry_run:
             (where / "Backup").mkdir(exist_ok=True)
             for src, dest in moves:
-                shutil.move(src, dest)
-        return {"folder": str(where), "moves": moves, "skipped": skipped, "dry_run": dry_run}
+                shutil.move(str(src), str(dest))
+        return {"folder": str(where), "backup_folder": str(where / "Backup"),
+                "files": [src.name for src, _dest in moves], "skipped": skipped,
+                "dry_run": dry_run}
 
     @mcp.tool()
     def fl_show_plugin_editor(channel: int, show: bool = True) -> dict:
