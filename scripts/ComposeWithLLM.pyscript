@@ -89,6 +89,7 @@ def process_mcp_request():
             return None
 
         # Process all requests in order
+        probe_result = None
         total_notes = 0
         notes_deleted = 0
 
@@ -113,6 +114,8 @@ def process_mcp_request():
                 result = add_notes_to_piano_roll(request)
                 if result and result.get("status") == "success":
                     total_notes += result.get("notes_added", 0)
+            elif action == "probe":
+                probe_result = probe_environment()
 
         # Clear the request queue after processing
         with open(REQUEST_FILE, 'w') as f:
@@ -122,11 +125,35 @@ def process_mcp_request():
             "status": "success",
             "requests_processed": len(requests),
             "notes_added": total_notes,
-            "notes_deleted": notes_deleted
+            "notes_deleted": notes_deleted,
+            "probe": probe_result,
         }
 
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+def probe_environment():
+    """Report what this piano-roll script can see (read-only, for diagnostics)."""
+    info = {
+        "flp": [a for a in dir(flp) if not a.startswith("_")],
+        "score": [a for a in dir(flp.score) if not a.startswith("_")],
+    }
+    # Names only: instantiating flp.Pattern() or reading its attributes crashes FL 2026.
+    info["Pattern_names"] = [a for a in dir(flp.Pattern) if not a.startswith("_")]
+    info["Utils_names"] = [a for a in dir(flp.Utils) if not a.startswith("_")]
+    for name in ("channels", "patterns", "ui", "general", "plugins", "mixer"):
+        try:
+            mod = __import__(name)
+            info[name] = "importable"
+            if name == "channels":
+                info["selected_channel"] = mod.selectedChannel()
+                info["selected_channel_name"] = mod.getChannelName(mod.selectedChannel())
+            if name == "patterns":
+                info["pattern_number"] = mod.patternNumber()
+        except Exception as e:
+            info[name] = "ERR " + type(e).__name__ + ": " + str(e)
+    return info
 
 
 def add_chord_to_piano_roll(request):

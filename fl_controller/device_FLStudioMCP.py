@@ -25,10 +25,14 @@ from pathlib import Path
 
 # FL Studio API modules (available when running inside FL Studio)
 import channels
+import device
+import general
 import midi
 import mixer
+import patterns
 import plugins
 import transport
+import ui
 
 
 def _get_script_dir() -> Path:
@@ -78,6 +82,60 @@ def OnMidiMsg(event):
     if event.midiId == 0x90 and event.data1 == TRIGGER_NOTE and event.data2 > 0:
         execute_pending_command()
         event.handled = True
+
+
+# ---------------------------------------------------------------------------
+# SysEx transport: JSON commands/responses over MIDI, no files involved.
+#   F0 7D 'M' 'C' 'P' <dir> <seq_hi> <seq_lo> <chunk> <count> <base64 payload> F7
+#   dir 1 = request (host -> FL), 2 = response (FL -> host). On a loopback bus
+#   each side also hears its own messages, so the direction byte filters echoes.
+# ---------------------------------------------------------------------------
+SYSEX_HEADER = bytes([0xF0, 0x7D, 0x4D, 0x43, 0x50])
+DIR_REQUEST, DIR_RESPONSE = 1, 2
+SYSEX_CHUNK = 192
+_sysex_buffers = {}
+
+
+def _b64encode(data):
+    import binascii
+    return binascii.b2a_base64(data, newline=False)
+
+
+def _b64decode(data):
+    import binascii
+    return binascii.a2b_base64(data)
+
+
+def _send_sysex_response(seq, obj):
+    payload = _b64encode(json.dumps(obj).encode("utf-8"))
+    chunks = [payload[i:i + SYSEX_CHUNK] for i in range(0, len(payload), SYSEX_CHUNK)] or [b""]
+    for idx, chunk in enumerate(chunks):
+        msg = SYSEX_HEADER + bytes([DIR_RESPONSE, (seq >> 7) & 0x7F, seq & 0x7F, idx, len(chunks)]) + chunk + b"\xf7"
+        device.midiOutSysex(msg)
+
+
+def OnSysEx(event):
+    data = bytes(event.sysex)
+    if not data.startswith(SYSEX_HEADER) or len(data) < 11:
+        return
+    event.handled = True
+    if data[5] != DIR_REQUEST:
+        return  # our own response echoing back on a loopback bus
+    seq = (data[6] << 7) | data[7]
+    idx, count = data[8], data[9]
+    parts = _sysex_buffers.setdefault(seq, {})
+    parts[idx] = data[10:-1]
+    if len(parts) < count:
+        return
+    raw = b"".join(parts[i] for i in range(count))
+    del _sysex_buffers[seq]
+    try:
+        command = json.loads(_b64decode(raw).decode("utf-8"))
+        result = dispatch_command(command.get("action", ""), command.get("params", {}) or {})
+        response = {"success": "error" not in result, **result}
+    except Exception as e:
+        response = {"success": False, "error": "Error executing command: " + str(e)}
+    _send_sysex_response(seq, response)
 
 
 def OnIdle():
@@ -228,6 +286,36 @@ def dispatch_command(action: str, params: dict) -> dict:
         return handle_plugins_prev_preset(params)
     elif action == "plugins.getColor":
         return handle_plugins_get_color(params)
+
+    # Extended commands
+    elif action == "transport.getTempo":
+        return handle_transport_get_tempo()
+    elif action == "transport.setTempo":
+        return handle_transport_set_tempo(params)
+    elif action == "patterns.getAll":
+        return handle_patterns_get_all()
+    elif action == "patterns.select":
+        return handle_patterns_select(params)
+    elif action == "patterns.create":
+        return handle_patterns_create(params)
+    elif action == "patterns.setName":
+        return handle_patterns_set_name(params)
+    elif action == "channels.openPianoRoll":
+        return handle_channels_open_piano_roll(params)
+    elif action == "channels.showEditor":
+        return handle_channels_show_editor(params)
+    elif action == "project.save":
+        return handle_project_save()
+    elif action == "plugins.getPresetNames":
+        return handle_plugins_get_preset_names(params)
+    elif action == "debug.exec":
+        return handle_debug_exec(params)
+    elif action == "ui.press":
+        return handle_ui_press(params)
+    elif action == "channels.closeEditor":
+        return handle_channels_close_editor(params)
+    elif action == "mixer.getTrackPlugins":
+        return handle_mixer_get_track_plugins(params)
 
     else:
         return {"error": f"Unknown action: {action}"}
@@ -544,7 +632,7 @@ def handle_channels_set_volume(params: dict) -> dict:
     """Set channel volume."""
     index = params.get("index", 0)
     volume = params.get("volume", 0.8)
-    channels.setChannelVolume(index, volume, True)
+    channels.setChannelVolume(index, volume, midi.PIM_None, True)
     return {
         "volume": channels.getChannelVolume(index, True),
         "channel_name": channels.getChannelName(index, True),
@@ -555,7 +643,7 @@ def handle_channels_set_pan(params: dict) -> dict:
     """Set channel pan."""
     index = params.get("index", 0)
     pan = params.get("pan", 0.0)
-    channels.setChannelPan(index, pan, True)
+    channels.setChannelPan(index, pan, midi.PIM_None, True)
     return {
         "pan": channels.getChannelPan(index, True),
         "channel_name": channels.getChannelName(index, True),
@@ -873,3 +961,148 @@ def handle_plugins_get_color(params: dict) -> dict:
         color = plugins.getColor(index, -1, use_global)
 
     return {"color": hex(color)}
+
+
+# =============================================================================
+# Extended Handlers (tempo, patterns, piano roll targeting, mixer FX slots)
+# =============================================================================
+
+
+def handle_transport_get_tempo() -> dict:
+    """Get the current project tempo in BPM."""
+    return {"bpm": mixer.getCurrentTempo() / 1000}
+
+
+def handle_transport_set_tempo(params: dict) -> dict:
+    """Set the project tempo in BPM."""
+    bpm = float(params.get("bpm", 120))
+    general.processRECEvent(
+        midi.REC_Tempo, int(bpm * 1000), midi.REC_Control | midi.REC_UpdateControl
+    )
+    return {"bpm": mixer.getCurrentTempo() / 1000}
+
+
+def _pattern_info(index: int) -> dict:
+    return {
+        "index": index,
+        "name": patterns.getPatternName(index),
+        "length_beats": patterns.getPatternLength(index),
+    }
+
+
+def handle_patterns_get_all() -> dict:
+    """List all non-empty patterns plus the current one."""
+    current = patterns.patternNumber()
+    result = []
+    # patternCount() can be 0 in a fresh project even though pattern 1 is selected
+    for i in range(1, max(patterns.patternCount(), current) + 1):
+        if patterns.isPatternDefault(i) and i != current:
+            continue
+        result.append(_pattern_info(i))
+    return {"current": current, "patterns": result}
+
+
+def handle_patterns_select(params: dict) -> dict:
+    """Switch to a pattern by index (1-based)."""
+    index = int(params.get("index", 1))
+    patterns.jumpToPattern(index)
+    return {"current": patterns.patternNumber(), **_pattern_info(patterns.patternNumber())}
+
+
+def handle_patterns_create(params: dict) -> dict:
+    """Jump to the first empty pattern and optionally name it."""
+    patterns.findFirstNextEmptyPat(midi.FFNEP_FindFirst | midi.FFNEP_DontPromptName)
+    index = patterns.patternNumber()
+    name = params.get("name")
+    if name:
+        patterns.setPatternName(index, name)
+    return _pattern_info(index)
+
+
+def handle_patterns_set_name(params: dict) -> dict:
+    """Rename a pattern."""
+    index = int(params.get("index", patterns.patternNumber()))
+    patterns.setPatternName(index, params.get("name", ""))
+    return _pattern_info(index)
+
+
+def handle_channels_open_piano_roll(params: dict) -> dict:
+    """Point the piano roll at a channel.
+
+    Showing an already-open piano roll keeps its old channel, so hide it first:
+    reopening it then picks up the selected channel.
+    """
+    index = int(params.get("index", 0))
+    ui.hideWindow(midi.widPianoRoll)
+    channels.selectOneChannel(index, True)
+    ui.showWindow(midi.widPianoRoll)
+    ui.setFocused(midi.widPianoRoll)
+    return {"channel": index, "name": channels.getChannelName(index)}
+
+
+def handle_mixer_get_track_plugins(params: dict) -> dict:
+    """List effect plugins loaded in a mixer track's slots."""
+    track = int(params.get("track", 0))
+    slots = []
+    for slot in range(10):
+        if plugins.isValid(track, slot):
+            slots.append({
+                "slot": slot,
+                "name": plugins.getPluginName(track, slot),
+                "param_count": plugins.getParamCount(track, slot),
+            })
+    return {"track": track, "track_name": mixer.getTrackName(track), "slots": slots}
+
+
+def handle_channels_close_editor(params: dict) -> dict:
+    """Hide a channel's plugin window (plugin UIs swallow keyboard shortcuts)."""
+    index = int(params.get("index", 0))
+    channels.showEditor(index, 0, True)
+    return {"channel": index}
+
+
+def handle_channels_show_editor(params: dict) -> dict:
+    """Show a channel's plugin window."""
+    index = int(params.get("index", 0))
+    channels.showEditor(index, 1, True)
+    return {"channel": index}
+
+
+def handle_project_save() -> dict:
+    """Save the project (same as Ctrl/Cmd+S) and report the window title."""
+    transport.globalTransport(midi.FPT_Save, 1)
+    return {"title": ui.getProgTitle()}
+
+
+def handle_plugins_get_preset_names(params: dict) -> dict:
+    """List preset (program) names a plugin exposes to the host."""
+    index = int(params.get("index", 0))
+    slot = int(params.get("slot_index", -1))
+    count = plugins.getPresetCount(index, slot, True)
+    names = [plugins.getName(index, slot, midi.FPN_Preset, i, True) for i in range(count)]
+    return {"count": count, "names": names}
+
+
+def handle_ui_press(params: dict) -> dict:
+    """Press a key inside FL (works the same on every OS)."""
+    keys = {"enter": ui.enter, "yes": ui.yes, "no": ui.no, "escape": ui.escape}
+    key = params.get("key", "")
+    if key not in keys:
+        return {"error": f"Unsupported key '{key}'"}
+    keys[key]()
+    return {"focused": ui.getFocusedFormCaption(), "channel_count": channels.channelCount(True)}
+
+
+def handle_debug_exec(params: dict) -> dict:
+    """Run a snippet inside FL's Python (development aid, avoids FL restarts).
+
+    The snippet sees the FL API modules and may assign a JSON-serializable
+    value to `result`.
+    """
+    scope = {
+        "channels": channels, "general": general, "midi": midi, "mixer": mixer,
+        "patterns": patterns, "plugins": plugins, "transport": transport, "ui": ui,
+        "result": None,
+    }
+    exec(params.get("code", ""), scope)
+    return {"result": scope["result"]}

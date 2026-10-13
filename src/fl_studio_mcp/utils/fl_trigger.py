@@ -36,25 +36,61 @@ class FLStudioTrigger:
         else:
             self._trigger_func = None
 
+    def _focus_piano_roll(self) -> None:
+        """Ask the FL controller script to focus the selected channel's piano roll.
+
+        The Cmd+Opt+Y "rerun last script" shortcut only works when the piano
+        roll window has focus inside FL Studio.
+        """
+        try:
+            from fl_studio_mcp.utils.connection import get_connection
+
+            conn = get_connection()
+            selected = conn.send_command("channels.getSelected").get("channel")
+            if selected is not None:
+                conn.send_command("channels.openPianoRoll", {"index": selected["index"]})
+        except Exception:
+            pass  # Best effort; the keystroke may still reach a focused piano roll
+
+    def show_channel_piano_roll(self, channel: int) -> bool:
+        """Point the piano roll at a specific channel (no keystrokes, any OS).
+
+        An already-open piano roll keeps its channel when shown again, so it is
+        hidden first. Runs as a snippet so it works regardless of which version
+        of the controller script FL has loaded (it only reloads on FL restart).
+        """
+        from fl_studio_mcp.utils.connection import get_connection
+
+        conn = get_connection()
+        result = conn.send_command("debug.exec", {"code": (
+            "ui.hideWindow(midi.widPianoRoll)\n"
+            f"channels.selectOneChannel({int(channel)}, True)\n"
+            "ui.showWindow(midi.widPianoRoll)\n"
+            "ui.setFocused(midi.widPianoRoll)\n"
+            "result = channels.selectedChannel(False, True)"
+        )})
+        return result.get("result") == channel
+
     def _trigger_macos(self) -> bool:
         """Trigger FL Studio on macOS using osascript."""
+        self._focus_piano_roll()
         try:
-            # Use osascript to send keystroke to FL Studio
+            # The app bundle name varies by version ("FL Studio 2026"), but the
+            # process is always OsxFL.
             script = '''
-            tell application "FL Studio"
-                activate
-            end tell
-            delay 0.3
             tell application "System Events"
-                keystroke "y" using {command down, option down}
+                tell process "OsxFL" to set frontmost to true
+                delay 1.0
+                -- key code 16 = physical Y key; keystroke "y" fails on non-Latin layouts
+                key code 16 using {command down, option down}
             end tell
             '''
-            subprocess.run(
+            proc = subprocess.run(
                 ["osascript", "-e", script],
                 capture_output=True,
                 timeout=10,
             )
-            return True
+            return proc.returncode == 0
         except subprocess.TimeoutExpired:
             return False
         except Exception:
@@ -70,7 +106,12 @@ class FLStudioTrigger:
 
             # Focus FL Studio first
             subprocess.run(
-                ["osascript", "-e", 'tell application "FL Studio" to activate'],
+                [
+                    "osascript",
+                    "-e",
+                    'tell application "System Events" to tell process "OsxFL" '
+                    "to set frontmost to true",
+                ],
                 capture_output=True,
                 timeout=5,
             )

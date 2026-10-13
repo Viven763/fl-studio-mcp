@@ -21,10 +21,13 @@ from __future__ import annotations
 from fastmcp import FastMCP
 
 from fl_studio_mcp.tools import (
+    register_audio_tools,
     register_channel_tools,
+    register_extended_tools,
     register_mixer_tools,
     register_piano_roll_tools,
     register_plugin_tools,
+    register_production_tools,
     register_transport_tools,
 )
 from fl_studio_mcp.utils.connection import get_connection, reset_connection
@@ -140,6 +143,9 @@ register_mixer_tools(mcp)
 register_channel_tools(mcp)
 register_plugin_tools(mcp)
 register_piano_roll_tools(mcp)
+register_extended_tools(mcp)
+register_audio_tools(mcp)
+register_production_tools(mcp)
 
 
 def main():

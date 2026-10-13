@@ -1,20 +1,27 @@
 """MIDI-based connection to FL Studio.
 
-This module provides communication with FL Studio via MIDI messages and JSON files.
-The approach is:
-1. Write command data to a JSON file
-2. Send a MIDI trigger note to FL Studio
-3. FL Studio's MIDI controller script executes the command
-4. Read the response from a JSON file
+Primary transport: SysEx. Commands and responses travel as JSON inside MIDI
+system-exclusive messages over the virtual MIDI port, so nothing touches disk:
 
-This is similar to how the piano_roll module works, but uses MIDI for triggering
-instead of keystrokes.
+    F0 7D 'M' 'C' 'P' <dir> <seq_hi> <seq_lo> <chunk> <count> <base64 JSON> F7
+
+dir 1 = request (host -> FL), 2 = response (FL -> host). On a loopback port
+both sides hear their own messages too; the direction byte filters echoes.
+
+Fallback transport (controller scripts that predate SysEx support): write the
+command to a JSON file, send MIDI note 127 as a trigger, read the response file.
+The transport is chosen once per connection with a harmless probe; after SysEx
+is confirmed a lost reply is reported as a timeout instead of being retried over
+files, so a command can never run twice.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import platform
+import random
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -45,12 +52,25 @@ class MIDIConnection:
 
     # MIDI trigger note (same as in FL Studio controller script)
     TRIGGER_NOTE = 127
+    SYSEX_HEADER = [0x7D, 0x4D, 0x43, 0x50]  # manufacturer 0x7D (non-commercial) + "MCP"
+    DIR_REQUEST, DIR_RESPONSE = 1, 2
+    SYSEX_CHUNK = 192
 
     def __init__(self) -> None:
         self._port = None
+        self._in_port = None
         self._port_name: str | None = None
         self._connected = False
         self._error: str | None = None
+        self._transport: str | None = None  # "sysex" or "file", decided on first command
+        # Several clients (the MCP server, scripts) can share the loopback port: start each
+        # at a random sequence number and only accept replies to our own pending requests.
+        self._seq = random.randrange(16384)
+        self._pending: set[int] = set()
+        self._chunks: dict[int, dict[int, bytes]] = {}
+        self._replies: dict[int, dict[str, Any]] = {}
+        self._cond = threading.Condition()
+        self._lock = threading.Lock()
 
         # File paths for JSON communication
         self._hardware_dir = _get_fl_hardware_dir()
@@ -117,13 +137,92 @@ class MIDIConnection:
             self._port_name = target_port
             self._connected = True
             self._error = None
-            return True
         except Exception as e:
             self._error = f"Failed to open MIDI port '{target_port}': {e}"
             return False
+        try:  # the reply channel; without it only the file transport works
+            if target_port in mido.get_input_names():
+                self._in_port = mido.open_input(target_port, callback=self._on_midi)
+        except Exception:
+            self._in_port = None
+        return True
+
+    def _on_midi(self, msg) -> None:
+        """Collect SysEx response chunks (runs on mido's callback thread)."""
+        if msg.type != "sysex":
+            return
+        data = list(msg.data)
+        if data[:4] != self.SYSEX_HEADER or len(data) < 9 or data[4] != self.DIR_RESPONSE:
+            return
+        seq = (data[5] << 7) | data[6]
+        idx, count = data[7], data[8]
+        with self._cond:
+            if seq not in self._pending:
+                return  # a reply to another client
+            parts = self._chunks.setdefault(seq, {})
+            parts[idx] = bytes(data[9:])
+            if len(parts) < count:
+                return
+            raw = b"".join(parts[i] for i in range(count))
+            del self._chunks[seq]
+            try:
+                self._replies[seq] = json.loads(base64.b64decode(raw).decode("utf-8"))
+            except Exception as e:
+                self._replies[seq] = {"success": False, "error": f"Bad SysEx reply: {e}"}
+            self._cond.notify_all()
+
+    def _send_sysex(self, command: dict[str, Any], timeout: float) -> dict[str, Any] | None:
+        """Send one command over SysEx; None if no reply arrived in time."""
+        import mido
+
+        with self._lock:
+            self._seq = (self._seq + 1) % 16384
+            seq = self._seq
+        with self._cond:
+            self._pending.add(seq)
+            self._replies.pop(seq, None)
+        payload = base64.b64encode(json.dumps(command).encode("utf-8"))
+        size = self.SYSEX_CHUNK
+        chunks = [payload[i:i + size] for i in range(0, len(payload), size)]
+        for idx, chunk in enumerate(chunks or [b""]):
+            meta = [self.DIR_REQUEST, (seq >> 7) & 0x7F, seq & 0x7F, idx, len(chunks)]
+            head = self.SYSEX_HEADER + meta
+            self._port.send(mido.Message("sysex", data=head + list(chunk)))
+        deadline = time.time() + timeout
+        with self._cond:
+            try:
+                while seq not in self._replies:
+                    left = deadline - time.time()
+                    if left <= 0:
+                        self._chunks.pop(seq, None)
+                        return None
+                    self._cond.wait(left)
+                return self._replies.pop(seq)
+            finally:
+                self._pending.discard(seq)
+
+    def _choose_transport(self) -> None:
+        """Probe once: does the controller script answer over SysEx?"""
+        if self._transport is not None:
+            return
+        reply = None
+        if self._in_port is not None:
+            reply = self._send_sysex({"action": "channels.getCount", "params": {}}, timeout=1.0)
+        self._transport = "sysex" if reply is not None else "file"
+
+    @property
+    def transport(self) -> str | None:
+        return self._transport
 
     def disconnect(self) -> None:
         """Close the MIDI connection."""
+        if self._in_port is not None:
+            try:
+                self._in_port.close()
+            except Exception:
+                pass
+            self._in_port = None
+        self._transport = None
         if self._port is not None:
             try:
                 self._port.close()
@@ -167,6 +266,16 @@ class MIDIConnection:
             "action": action,
             "params": params or {},
         }
+
+        self._choose_transport()
+        if self._transport == "sysex":
+            reply = self._send_sysex(command, timeout)
+            if reply is None:
+                return {
+                    "success": False,
+                    "error": f"Timeout waiting for FL Studio SysEx reply after {timeout}s.",
+                }
+            return reply
 
         # Write command to file
         try:
@@ -243,6 +352,7 @@ class MIDIConnection:
 
         return {
             "connected": self.is_connected,
+            "transport": self._transport,
             "port_name": self._port_name,
             "available_ports": output_ports,
             "command_file": str(self._command_file),

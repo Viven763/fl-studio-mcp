@@ -117,9 +117,21 @@ def _get_trigger_info(auto_trigger: bool) -> str:
     trigger = get_trigger()
     if not trigger.is_supported:
         return f" Auto-trigger not supported on {trigger.platform}. Press the trigger key manually."
-    if trigger_fl_studio():
-        return " FL Studio triggered successfully."
-    return f" Warning: Could not trigger FL Studio. Press {trigger.keystroke} manually."
+    state_file = _get_state_file()
+    before = state_file.stat().st_mtime if state_file.exists() else 0.0
+    if not trigger_fl_studio():
+        return f" Warning: Could not trigger FL Studio. Press {trigger.keystroke} manually."
+    # The keystroke only reruns the *last* piano roll script, so after an FL
+    # restart it silently does nothing. Confirm the script actually ran by
+    # checking that it re-exported the state file.
+    if state_file.exists() and state_file.stat().st_mtime > before:
+        return " FL Studio applied the changes."
+    # Drop the unprocessed request so it can't later hit the wrong channel.
+    _clear_request_file()
+    return (
+        " ERROR: the ComposeWithLLM script did not run, request discarded. "
+        "In FL Studio open the Piano Roll menu > Scripts > ComposeWithLLM once, then retry."
+    )
 
 
 def register_piano_roll_tools(mcp: FastMCP) -> None:
