@@ -23,12 +23,14 @@ from fl_studio_mcp.tools import (
     register_audio_tools,
     register_channel_tools,
     register_extended_tools,
+    register_instrument_tools,
     register_mixer_tools,
     register_params_tools,
     register_piano_roll_tools,
     register_plugin_tools,
     register_production_tools,
     register_project_tools,
+    register_remake_tools,
     register_sample_tools,
     register_transport_tools,
 )
@@ -46,6 +48,10 @@ Workflow guide:
   between channels and patterns, transpose, velocity, shift, delete) instead of
   resending whole parts. Read with fl_read_notes.
 - Arrange with fl_arrange; name/create patterns with fl_set_pattern_names.
+- Any installed plugin: fl_find_plugins, then fl_load_instrument (new channel, from file) or
+  fl_add_effects (any installed effect into a mixer slot). Automation clips (plugin params,
+  channel/mixer volume or pan, tempo): fl_automate, fl_read_automation. fl_audition renders
+  one channel playing given notes and describes its sound (optionally vs a reference note).
 - Mixer: fl_mixer_setup (routes, names, sends add/remove/exclusive, faders in dB) and
   fl_get_mixer_routing to read it back. Effects: fl_add_effects, then
   fl_set_effect_params (by number, name, or text label like "High pass").
@@ -59,6 +65,24 @@ Workflow guide:
   (fl_zenology_load) or swap on an existing channel (fl_zenology_set_tone) from file, without
   screen or mouse. Never-seen tones need allow_screen=true once - ask the user first, since FL
   takes the screen and mouse for ~10 s. fl_zenology_current_tone tells what a channel holds.
+  fl_zenology_find covers every installed tone with a known name; fl_zenology_index_packs lists
+  packs whose names are unknown (no sound-list PDF) and, with allow_screen after asking the
+  user, reads them from ZENOLOGY's window (~1 s per tone, resumable).
+
+Remaking ("copy") a beat from a reference track - note for note, not "in the style of":
+1. fl_reference_map(path): exact bpm, bar0 (bar 1's downbeat), sections with repeats
+   ("like": same notes as bars ...), chords and bass per bar. Set the project tempo to it.
+2. fl_transcribe_reference(path, start_bar, end_bar) for each distinct section: copy every
+   token of top / low / chords / bass and the drone (pad). Never keep only the loudest note
+   per beat - runs, second voices, octave jumps in the bass and stabs are the music. Use
+   step="16th" where notes repeat fast (rolls, ghost notes). drum_tones are not notes.
+3. fl_sound_profile on exposed notes of each layer to pick the instrument: decaying +
+   harmonic = piano/pluck, sustained = pad/choir, inharmonic or pure-but-decaying = bell or a
+   pitched-down cowbell. Search with the returned words.
+4. fl_write_lines with the same token lines; fl_arrange to the section map.
+5. fl_check_channel_pitch on every pitched channel and fix offsets (presets/tones/samples
+   are often 12+ semitones off); then fl_render + fl_compare_notes(reference, bars) until
+   recall/lead are high, and fl_render_analyze(reference=...) for the balance.
 
 Notes:
 - File-based tools save the project first and reload it; FL's undo history is cleared.
@@ -162,6 +186,8 @@ register_production_tools(mcp)
 register_params_tools(mcp)
 register_project_tools(mcp)
 register_sample_tools(mcp)
+register_remake_tools(mcp)
+register_instrument_tools(mcp)
 
 
 def main():

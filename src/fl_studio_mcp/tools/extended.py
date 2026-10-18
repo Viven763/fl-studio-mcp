@@ -245,6 +245,98 @@ def register_extended_tools(mcp: FastMCP) -> None:
         return {"tones": tones}
 
     @mcp.tool()
+    def fl_zenology_index_packs(
+        packs: list[str] | None = None,
+        allow_screen: bool = False,
+        include_factory: bool = True,
+        max_packs: int | None = None,
+    ) -> dict:
+        """Make every installed ZENOLOGY tone searchable, including packs without a sound list.
+
+        Tone names come from the packs' PDF sound lists; packs without one (newer
+        SDZ/ZEZ packs, model expansion packs, the factory banks PRST_A-L) are read
+        from ZENOLOGY's own window: one channel per pack, the tone arrow is
+        stepped through every tone and the shown "NNN: Name" is read (OCR). The
+        names are kept in MCP Snapshots/ZENOLOGY/_screen_index.json and found by
+        fl_zenology_find right away; progress is saved after every pack, so a run
+        can be stopped and resumed. The helper channels are deleted at the end.
+
+        Without allow_screen it only lists what is missing and how long reading
+        it would take. With allow_screen=true FL comes to the front and the
+        mouse is used the whole time (about 1 s per tone) - ask the user first.
+
+        Args:
+            packs: Only these packs (folder names like "SDZ101_ArgonSky" or "PRST_A")
+            allow_screen: Read the packs now (FL in front, mouse in use)
+            include_factory: Also the factory banks PRST_A-L
+            max_packs: Stop after this many packs (to work in batches)
+        """
+        import subprocess
+
+        from fl_studio_mcp.utils.fl_exec import exec_in_fl
+        from fl_studio_mcp.utils.flp_edit import delete_channels
+        from fl_studio_mcp.utils.zenology import (
+            SECONDS_PER_TONE,
+            ZenologyError,
+            _activate_fl,
+            crawl_pack,
+            save_screen_index,
+            unindexed_packs,
+        )
+
+        todo = unindexed_packs(include_factory)
+        if packs:
+            want = {p.strip() for p in packs}
+            todo = [p for p in todo if p["pack"] in want]
+        if max_packs:
+            todo = todo[:max_packs]
+        est = {"SDZ": 34, "ZEZ": 40, "M0": 64, "EXZ": 30, "PRS": 256}
+        tones_est = sum(next((v for k, v in est.items() if p["pack"].startswith(k)), 64)
+                        for p in todo)
+        if not allow_screen or not todo:
+            return {"missing_packs": [p["pack"] for p in todo], "count": len(todo),
+                    "estimated_tones": tones_est,
+                    "estimated_minutes": round(tones_est * SECONDS_PER_TONE / 60),
+                    "note": "call again with allow_screen=true to read them (FL in front, "
+                            "mouse in use the whole time; ask the user first)"}
+        if platform.system() != "Darwin":
+            return {"error": "reading tone names on screen is macOS-only"}
+        send = get_connection().send_command
+        done, failed, channels = [], [], []
+        with EDIT_LOCK:
+            _activate_fl()
+            time.sleep(1.0)
+            for pack in todo:
+                try:
+                    r = crawl_pack(pack, send)
+                except (ZenologyError, subprocess.SubprocessError, OSError, RuntimeError) as e:
+                    failed.append({"pack": pack["pack"], "error": str(e)})
+                    if "frontmost" in str(e):
+                        break  # the user took the screen back: stop here, resume later
+                    continue
+                channels.append(r["channel"])
+                if r["tones"]:
+                    save_screen_index(r["tones"])
+                    done.append({"pack": pack["pack"], "tones": len(r["tones"])})
+                else:
+                    failed.append({"pack": pack["pack"], "error": "no tone names read"})
+            cleanup = None
+            if channels:
+                try:
+                    project = save_project_and_locate(send)
+                    live = exec_in_fl("result = [channels.getChannelName(c, True) "
+                                      "for c in range(channels.channelCount(1))]")
+                    res = delete_channels(project, None, sorted(channels), live_names=live)
+                    cleanup = {"deleted_channels": len(channels),
+                               "reloaded": reopen_and_wait(send, project,
+                                                           expected=res["channels"])}
+                except (RuntimeError, ValueError, OSError) as e:
+                    cleanup = {"error": f"helper channels not deleted: {e}",
+                               "channels": channels}
+        return {"indexed": done, "failed": failed, "cleanup": cleanup,
+                "still_missing": len(unindexed_packs(include_factory))}
+
+    @mcp.tool()
     def fl_zenology_library(query: str | None = None, rescan: bool = False) -> dict:
         """The ZENOLOGY tone library: tones that load and swap from file, without the screen.
 

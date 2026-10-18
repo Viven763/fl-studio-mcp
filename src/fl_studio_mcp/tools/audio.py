@@ -10,7 +10,6 @@ start/stop playback and restore the previous position.
 from __future__ import annotations
 
 import math
-import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -171,11 +170,12 @@ def register_audio_tools(mcp: FastMCP) -> None:
     ) -> dict:
         """How loud each instrument really is in the mix: render stems and measure them.
 
-        Renders the saved project once per stem in the background (about a
-        minute each, plus one for the full mix) with every other channel
-        switched off in the rendered copy; your project is not changed or
-        reloaded. Use `groups` to keep it fast, e.g. {"drums": ["Kick", "Snare",
-        "Hats"], "bass": ["Upright Bass", "808"], "violin": [9]}.
+        One hidden background FL instance renders the full mix and every stem
+        (copies of the saved project with all other channels switched off): no
+        window, your FL keeps its focus and the project isn't changed or
+        reloaded. Takes about a minute plus a few seconds per stem. Use
+        `groups`, e.g. {"drums": ["Kick", "Snare", "Hats"], "bass": ["808"],
+        "lead": [9]}.
 
         Args:
             channels: One stem per channel (exact names or global indices)
@@ -199,7 +199,7 @@ def register_audio_tools(mcp: FastMCP) -> None:
             lufs,
         )
         from fl_studio_mcp.utils.fl_mixer import resolve_channels
-        from fl_studio_mcp.utils.fl_render import render_project
+        from fl_studio_mcp.utils.fl_render import render_versions, safe_stem
         from fl_studio_mcp.utils.flp_edit import (
             CH_TYPE_AUTOMATION,
             channel_enabled,
@@ -256,18 +256,24 @@ def register_audio_tools(mcp: FastMCP) -> None:
                             "sections": secs}, energy_k(x, sr)
 
                 result: dict[str, Any] = {"band_edges_hz": BAND_EDGES, "skipped": skipped}
+                versions: dict[str, Any] = {}
+                outputs: dict[str, Path] = {}
+                if mix:
+                    versions["mix"] = None
+                    outputs["mix"] = folder / "_mix.wav"
+                for n, (label, chans) in enumerate(stems):
+                    keep = set(chans)
+                    versions[f"stem{n}"] = lambda evs, keep=keep: set_channels_enabled(evs, keep)
+                    outputs[f"stem{n}"] = folder / f"{n + 1:02d} {safe_stem(label)}.wav"
+                wavs = render_versions(project, versions, outputs)
                 mix_energy = None
                 if mix:
-                    m, mix_energy = measure(render_project(project))
+                    m, mix_energy = measure(wavs["mix"])
                     result["mix"] = {k: m[k] for k in ("lufs", "peak_dbfs", "bands_pct")}
+                    wavs["mix"].unlink(missing_ok=True)
                 out = []
-                for label, chans in stems:
-                    safe = re.sub(r'[\\/:*?"<>|]', "_", label).strip() or "stem"
-                    keep = set(chans)
-                    wav = render_project(
-                        project, out=folder / f"{safe}.wav",
-                        patch=lambda evs, keep=keep: set_channels_enabled(evs, keep),
-                    )
+                for n, (label, chans) in enumerate(stems):
+                    wav = wavs[f"stem{n}"]
                     stats, energy = measure(wav)
                     row = {"name": label, "channels": [names[c] for c in chans], **stats,
                            "_energy": energy}

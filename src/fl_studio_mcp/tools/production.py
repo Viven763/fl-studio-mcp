@@ -94,8 +94,10 @@ def register_production_tools(mcp: FastMCP) -> None:
     def fl_add_effects(effects: list[dict]) -> dict:
         """Insert effect plugins into empty mixer slots (one reload, state restored).
 
-        Effects are copied from FL's own template projects, so only stock effects
-        used there are available (e.g. "Fruity Parametric EQ 2", "Fruity Limiter",
+        Any installed effect works (fl_find_plugins kind="effect"): instances from
+        FL's template projects are used when there is one, otherwise the plugin's
+        entry in FL's plugin database (default settings; AU/VST with their saved
+        state). Stock effects in the templates: "Fruity Parametric EQ 2", "Fruity Limiter",
         "Fruity Reeverb 2", "Fruity Delay 3", "Fruity Fast Dist", "Fruity Soft Clipper",
         "Fruity Compressor", "Fruity Chorus", "Fruity Stereo Shaper").
         Template instances carry odd settings: always set parameters afterwards

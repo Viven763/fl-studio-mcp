@@ -63,22 +63,39 @@ def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", s.lower()).replace("1", "l").replace("i", "l")
 
 
+def screen_index_file() -> Path:
+    """Tone names read from ZENOLOGY's own window (packs without a sound-list PDF)."""
+    return snapshot_dir() / "ZENOLOGY" / "_screen_index.json"
+
+
 @functools.lru_cache(maxsize=1)
 def _tones() -> tuple[dict, ...]:
-    return tuple(json.loads(TONES_FILE.read_text()))
+    tones = json.loads(TONES_FILE.read_text())
+    extra = screen_index_file()
+    if extra.exists():
+        known = {(t["pack"], t["no"]) for t in tones}
+        try:
+            tones += [t for t in json.loads(extra.read_text()) if (t["pack"], t["no"]) not in known]
+        except (OSError, ValueError):
+            pass
+    return tuple(tones)
 
 
 def find_tones(query: str, limit: int = 20) -> list[dict]:
+    """Tones whose name, category or pack match every word; exact names first."""
     tones = [dict(t) for t in _tones()]
     q = _norm(query)
-    exact = [t for t in tones if _norm(t["name"]) == q]
-    if exact:
-        return exact[:limit]
-    words = [w for w in re.split(r"\s+", query.lower()) if w]
-    def hit(t: dict) -> bool:
-        return all(_norm(w) in _norm(t["name"]) or _norm(w) in _norm(t["category"]) for w in words)
+    words = [_norm(w) for w in re.split(r"\s+", query) if _norm(w)]
 
-    return [t for t in tones if hit(t)][:limit]
+    def hay(t: dict) -> str:
+        return _norm(t["name"]) + "|" + _norm(t["category"]) + "|" + _norm(t["pack"]) + "|" + \
+            _norm(t.get("pack_title", ""))
+
+    exact = [t for t in tones if _norm(t["name"]) == q]
+    named = [t for t in tones if t not in exact and all(w in _norm(t["name"]) for w in words)]
+    rest = [t for t in tones if t not in exact and t not in named
+            and all(w in hay(t) for w in words)]
+    return (exact + named + rest)[:limit]
 
 
 def _pack_size(pack: str) -> int:
@@ -797,3 +814,136 @@ def load_factory_tone(bank: str, number: int, send_command, name: str | None = N
     result = _select_on_screen(tone, channel, label, True, send_command, read_state)
     result["tone"] = name or f"Factory {int(number)}"
     return result
+
+
+# ---------------------------------------------------------------- indexing packs on screen
+DATA_ROOTS = (
+    os.environ.get("ZENOLOGY_DATA", ""),
+    "/Library/Application Support/Roland Cloud/ZENOLOGY",
+    r"C:\ProgramData\Roland Cloud\ZENOLOGY",
+    r"C:\Program Files\Roland Cloud\ZENOLOGY",
+)
+FACTORY_BANKS = "ABCDEFGHIJKL"
+SECONDS_PER_TONE = 1.1
+
+
+def installed_packs() -> list[dict]:
+    """Every installed expansion / sound pack, with the id and title from its file header."""
+    root = next((Path(c) for c in DATA_ROOTS if c and Path(c).is_dir()), None)
+    out = []
+    for folder in sorted(root.iterdir()) if root else []:
+        if not folder.is_dir():
+            continue
+        files = [f for f in folder.iterdir() if f.suffix in (".exz", ".sdz")]
+        if not files:
+            continue
+        head = files[0].read_bytes()[:64]
+        out.append({"pack": folder.name, "pack_id": struct.unpack("<H", head[16:18])[0],
+                    "pack_title": head[32:64].decode("ascii", "replace").split("\x00")[0].strip()})
+    return out
+
+
+def unindexed_packs(include_factory: bool = True) -> list[dict]:
+    """Installed packs (and factory banks) with no tone names in the index yet."""
+    indexed = {t["pack"] for t in _tones()}
+    packs = [p for p in installed_packs() if p["pack"] not in indexed]
+    if include_factory:
+        packs += [{"pack": f"PRST_{b}", "pack_id": factory_pack_id(b), "pack_title": "Factory"}
+                  for b in FACTORY_BANKS if f"PRST_{b}" not in indexed]
+    return packs
+
+
+_LABEL_LINE = re.compile(r"^[^\d\n]{0,4}(\d{1,4})\s*[:：]\s*(\S.*?)\s*$")
+
+
+def parse_tone_label(text: str) -> list[tuple[int, str]]:
+    """("068", "SA Vibe SRX") pairs from the OCR text of the plugin window."""
+    out = []
+    for line in text.splitlines():
+        m = _LABEL_LINE.match(line.strip())
+        if m and re.search(r"[A-Za-z]", m.group(2)):
+            out.append((int(m.group(1)), m.group(2)))
+    return out
+
+
+def crawl_pack(
+    pack: dict,
+    send_command,
+    settle: float = 0.8,
+    max_tones: int = 1200,
+    click: Callable | None = None,
+    observe: Callable | None = None,
+    find_window: Callable | None = None,
+    open_channel: Callable | None = None,
+) -> dict:
+    """Read every tone name of one pack from ZENOLOGY's window.
+
+    A channel is opened on the pack's tone 2 (stored index 1), ▲ loads tone 1,
+    then ▼ steps through the pack while the shown "NNN: Name" line is read. It
+    stops when the number wraps around or stops moving. The window is closed;
+    the channel stays (delete it afterwards).
+    """
+    click = click or _click_arrow
+    observe = observe or _observe_screen
+    name = "ZEN index"
+    if open_channel is None:
+        existing = [c["name"] for c in send_command("channels.getAll").get("channels", [])]
+        name = unique_channel_name(name, existing)
+        folder = CACHE / f"zen_index_{pack['pack_id']}"
+        folder.mkdir(parents=True, exist_ok=True)
+        channel = _open_fst(build_fst(pack["pack_id"], 1, name, folder / f"{name}.fst"),
+                            send_command)
+    else:
+        channel = open_channel()
+    find_window = find_window or (lambda: _find_window(name, channel, send_command))
+    if click is _click_arrow and not _front_is_fl():
+        raise ZenologyError("FL Studio is not the frontmost app; refusing to click")
+    tones: dict[int, str] = {}
+    misses = 0
+    try:
+        rect = find_window()
+        if rect is None:
+            raise ZenologyError(f"ZENOLOGY window for channel {channel} did not open")
+        click(rect, "prev")
+        expected, last_shown = 1, None
+        for _ in range(max_tones):
+            time.sleep(settle)
+            _numbers_seen, label = observe(rect, f"{name} (")
+            seen = dict(parse_tone_label(label))
+            if expected not in seen:  # OCR can lag behind the tone change: look once more
+                time.sleep(settle)
+                seen = dict(parse_tone_label(observe(rect, f"{name} (")[1]))
+            if expected in seen:
+                tones[expected] = seen[expected]
+                shown, misses = expected, 0
+            else:
+                shown = min(seen, key=lambda n: abs(n - expected)) if seen else None
+                misses += 1
+                if shown is not None and shown < expected - 1:
+                    break  # wrapped around to the start: the pack is done
+                if misses >= 3:
+                    break
+            if shown is not None and shown == last_shown and shown != expected:
+                break  # the arrow no longer moves
+            last_shown = shown
+            expected += 1
+            click(rect, "next")
+    finally:
+        send_command("channels.closeEditor", {"index": channel})
+    return {"pack": pack["pack"], "channel": channel, "channel_name": name,
+            "tones": [{"pack": pack["pack"], "pack_id": pack["pack_id"],
+                       "pack_title": pack.get("pack_title", ""), "no": n, "name": t,
+                       "category": "", "source": "screen"} for n, t in sorted(tones.items())]}
+
+
+def save_screen_index(new_tones: list[dict]) -> int:
+    """Merge tones read on screen into the extra index; returns how many are stored."""
+    path = screen_index_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    old = json.loads(path.read_text()) if path.exists() else []
+    merged = {(t["pack"], t["no"]): t for t in old}
+    merged.update({(t["pack"], t["no"]): t for t in new_tones})
+    path.write_text(json.dumps(sorted(merged.values(), key=lambda t: (t["pack"], t["no"])),
+                               ensure_ascii=False, indent=0))
+    _tones.cache_clear()
+    return len(merged)

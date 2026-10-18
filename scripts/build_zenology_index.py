@@ -35,18 +35,22 @@ for pack in sorted(ROOT.iterdir()):
         continue
     head = files[0].read_bytes()[:64]
     pack_id = struct.unpack('<H', head[16:18])[0]
-    title = head[32:64].decode('ascii', 'replace').strip()
+    title = head[32:64].decode('ascii', 'replace').split('\x00')[0].strip()
     seen = set()
     for pdf in sorted(pack.glob('*.pdf')):
         cmd = ['pdftotext', '-layout', str(pdf), '-']
         text = subprocess.run(cmd, capture_output=True, text=True).stdout
         # Only the tone list is selectable; later sections list drum-kit
         # instruments and waveforms, whose names/numbers would mislead.
-        cut = re.search(r"Drum Kit (Tone )?List|Drum Kit Name|Wave(form)? List|Multisample", text)
+        # Two-column PDFs put "Waveform List" / "Drum Kit Tone List" next to the
+        # tone list on the same line, so only a heading that starts a line ends it.
+        cut = re.search(r"(?m)^\s{0,12}(Drum Kit (Tone )?List|Drum Kit Name|Wave(form)? List"
+                        r"|Multisample)", text)
         if cut:
             text = text[:cut.start()]
+        strict = "MSB" in text
         for line in text.splitlines():
-            tok = re.split(r'\s{2,}|\s*\|\s*', line.strip())
+            tok = re.split(r'\s{2,}', line.strip())  # '|' is part of some names
             i = 0
             while i + 2 < len(tok):
                 no, name, cat = tok[i], tok[i + 1], tok[i + 2]
@@ -54,8 +58,11 @@ for pack in sorted(ROOT.iterdir()):
                 # categories; they are not selectable tones (loading one by number
                 # selects an unrelated tone).
                 drum_part = cat in ('Kick', 'Snare', 'Hi-Hat', 'Cymbal', 'Ride', 'Tom')
+                # where the list has MSB/LSB/PC columns, a real tone row has them
+                # (wave and drum-instrument lists in the other column don't)
+                bank_cols = all(is_int(t) for t in tok[i + 3:i + 6]) and len(tok) >= i + 6
                 if (is_int(no) and not is_int(name) and not is_int(cat) and 0 < int(no) < 2000
-                        and not drum_part):
+                        and not drum_part and (bank_cols or not strict)):
                     key = (int(no), name)
                     if key not in seen:
                         seen.add(key)

@@ -56,6 +56,14 @@ def _plugin_group_before(events, marker: int) -> tuple[int, int] | None:
     return None
 
 
+def _group_name(group) -> str:
+    """Plugin name of a slot's event group; wrapped AU/VST plugins carry it in 203."""
+    name = _name(group[0][1])
+    if name == "Fruity Wrapper":
+        name = next((_name(v) for e, v in group if e == 203), name)
+    return name
+
+
 def find_effect_template(plugin: str) -> list[tuple[int, bytes]]:
     """Copy of a plugin's event group from the first FL template that uses it."""
     for install in fl_install_dirs():
@@ -69,14 +77,21 @@ def find_effect_template(plugin: str) -> list[tuple[int, bytes]]:
                 continue
             for i in range(first_insert, len(events)):
                 e, v = events[i]
-                if e == EV_PLUGIN_NAME and _name(v).lower() == plugin.lower():
+                if e == EV_PLUGIN_NAME:
                     j = i
                     while events[j][0] != EV_SLOT:
                         j += 1
                     group = events[i:j]
+                    if _group_name(group).lower() != plugin.lower():
+                        continue
                     if any(ev == EV_STATE for ev, _ in group):
                         return list(group)
-    raise ValueError(f"no FL template contains the effect '{plugin}'")
+    from fl_studio_mcp.utils.fl_plugins import effect_group, resolve_plugin
+
+    try:  # any installed effect: its plugin-database entry (defaults, or AU/VST state)
+        return effect_group(resolve_plugin(plugin, "effect"))
+    except ValueError as e:
+        raise ValueError(f"'{plugin}' is not in an FL template nor an installed effect: {e}") from e
 
 
 def list_slots(project: Path) -> dict[int, dict[int, str]]:
@@ -86,7 +101,7 @@ def list_slots(project: Path) -> dict[int, dict[int, str]]:
         for slot in range(SLOTS):
             group = _plugin_group_before(events, _slot_marker(events, insert, slot))
             if group:
-                out.setdefault(insert, {})[slot] = _name(events[group[0]][1])
+                out.setdefault(insert, {})[slot] = _group_name(events[group[0]:group[1]])
     return out
 
 

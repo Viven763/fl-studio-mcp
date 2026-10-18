@@ -2,6 +2,12 @@
 
 **Control FL Studio with plain language.** An MCP (Model Context Protocol) server that lets AI assistants drive FL Studio through MIDI communication and Piano Roll scripts — compose melodies, adjust mixes, and automate plugins without touching the mouse.
 
+> **About this fork:** it extends [karl-andres/fl-studio-mcp](https://github.com/karl-andres/fl-studio-mcp) with
+> [production tools](#production-tools-local-extensions): file-based composing (any pattern and channel, no piano
+> roll), mixer routing and effects, any installed plugin, automation clips, background renders, stems and
+> analysis, remaking a beat from a reference track, and Roland ZENOLOGY tone handling. Tested on macOS with
+> FL Studio 2026; the on-screen ZENOLOGY helpers are macOS only.
+
 [![Listed on mcpservers.org](https://mcpservers.org/badge.svg)](https://mcpservers.org/servers/karl-andres/fl-studio-mcp)
 [![Listed on awesome-mcp-servers](https://img.shields.io/badge/awesome--mcp--servers-listed-blue)](https://github.com/punkpeye/awesome-mcp-servers)
 [![GitHub stars](https://img.shields.io/github/stars/karl-andres/fl-studio-mcp?style=flat)](https://github.com/karl-andres/fl-studio-mcp/stargazers)
@@ -389,9 +395,12 @@ fl-studio-mcp
 |------|-------------|
 | `fl_mixer_setup` | Route channels, name inserts, add/remove/exclusive sends, faders in dB - one call, read back |
 | `fl_get_mixer_routing` | Which insert each channel feeds and every send with its level |
-| `fl_add_effects` | Add stock effects to empty mixer slots |
+| `fl_find_plugins` | Search every installed plugin (FL's plugin database): instruments and effects, FL's own and AU/VST |
+| `fl_load_instrument` | Add any installed instrument as a new channel from its database entry (no screen) |
+| `fl_add_effects` | Add effects to empty mixer slots: stock instances from FL's templates or any installed effect |
 | `fl_get_effect_params` / `fl_set_effect_params` | Effect parameters by index or name; set by value, displayed number or text label |
 | `fl_find_plugin_params` / `fl_set_plugin_params` | Same for instruments; search big plugins (ZENOLOGY) by name |
+| `fl_automate` / `fl_read_automation` | Write/read automation clips: plugin parameters, channel or mixer volume/pan, tempo (each target is checked in FL first) |
 
 **Sound and analysis** (background renders; the FL you work in is untouched)
 
@@ -399,14 +408,32 @@ fl-studio-mcp
 |------|-------------|
 | `fl_render`, `fl_render_analyze` | Render and analyse per playlist section; optional bar window and muted channels/inserts |
 | `fl_render_stems` | One render per channel or group: LUFS, loudness vs the mix, share of the mix, bands per stem |
+| `fl_audition` | Render one channel alone playing given notes and describe its sound (attack, decay, partials, loudness), optionally next to a note in a reference |
 | `fl_analyze_audio`, `fl_compare_audio` | Analyse any file (or a time window) / compare with a reference |
 | `fl_live_levels` | Peak per mixer track while FL plays a window (meters settle first, no stale tails) |
+
+**Remaking a beat from a reference** (note for note; analysis reads files only)
+
+| Tool | Description |
+|------|-------------|
+| `fl_reference_map` | Exact tempo, bar 1's downbeat, sections with repeats ("same notes as bars 9-12, drums differ"), chord and bass per bar |
+| `fl_transcribe_reference` | Bars as token lines per 8th/16th: top voice, second voice, chord stabs, bass line; drone and drum tones kept apart |
+| `fl_sound_profile` | Attack, decay, tremolo and partial ratios of a note: piano vs pad/choir vs bell/cowbell, with search words |
+| `fl_write_lines` | Write those token lines into patterns (`"D#4 - F5+A#5 . G4:0.5"`), with fl_write_parts' options |
+| `fl_check_channel_pitch` | Render each channel alone and compare what it sounds with its written notes: catches presets that play 12+ semitones off |
+| `fl_compare_notes` | Reference vs render per step: recall, precision, lead-note match, missing/extra notes per bar, octave hints |
+
+Lessons built into them: never keep only the loudest note per beat (runs, second voices,
+stabs and a moving bass are the music); melodic samples often sit slightly ahead of the kick;
+snare partials on 2 and 4 look like notes; a near-pure tone can be a pitched-down cowbell and
+a "choir" can be a piano; instruments often sound an octave or more off their MIDI notes.
 
 **Roland ZENOLOGY** (its library is encrypted; tones are reused from saved states)
 
 | Tool | Description |
 |------|-------------|
 | `fl_zenology_find` | Search installed tones; `in_library` = loads/swaps from file |
+| `fl_zenology_index_packs` | Packs without a sound-list PDF (newer SDZ/ZEZ, model packs, factory PRST banks): list them, or read every tone name from ZENOLOGY's window (`allow_screen=true`, ~1 s per tone, resumable) so `fl_zenology_find` covers all installed tones |
 | `fl_zenology_library` | The tone library: every tone ZENOLOGY played in a saved project/preset, one preset each (FL browser: Channel presets > MCP Snapshots > ZENOLOGY) |
 | `fl_zenology_load` | Add a tone as a new channel - from the library with FL in the background; a never-seen tone needs `allow_screen=true` once (FL in front, mouse ~10 s, macOS), then it joins the library |
 | `fl_zenology_set_tone` | Change the tone of an existing ZENOLOGY channel by editing the project file (keeps notes, routing, mono/legato) |
@@ -418,7 +445,8 @@ fl-studio-mcp
 - File-based edits save the project first, write a verified copy (atomic), keep a backup in `<project name> backups/` next to the project and reload the project in FL, restoring playback position, loop mode, pattern and open windows. FL's undo history is cleared by the reload.
 - Stereo separation: negative = wider (-1 = 100% separated), positive = towards mono.
 - Send levels are FL's send knob: 0.8 = unity (0 dB), 1.0 = max.
-- `fl_render_stems` takes about a minute per stem; group channels to keep it short.
+- Renders run in one hidden background FL instance: about a minute plus a few seconds per stem.
+  Projects with many heavy plugins can stall with many stems at once; group channels.
 - Song position: `fl_set_song_position(9, unit="bars")` (also seconds, ms, ticks, fraction).
 - Files are handed to FL in the background (`open -g`): keyboard focus and the visible desktop stay
   with the user. Only the one-time on-screen ZENOLOGY pick (`allow_screen=true`) brings FL forward
